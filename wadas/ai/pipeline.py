@@ -22,6 +22,7 @@ import logging
 import numpy as np
 import ray
 from PIL import Image
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from wadas.ai.models import (
     Classifier,
@@ -30,6 +31,7 @@ from wadas.ai.models import (
     OVMegaDetectorV6YOLO10,
     txt_animalclasses,
 )
+from wadas.ai.schedulers import ActuatorScheduler, MonitoringScheduler, OptimumScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,12 @@ NAME_TO_DETECTOR = {
     "MDV5-yolov5": OVMegaDetectorV5,
     "MDV6b-yolov9c": OVMegaDetectorV6YOLO9,
     "MDV6-yolov10n": OVMegaDetectorV6YOLO10,
+}
+
+USECASE_TO_SCHEDULER = {
+    "MONITORING": MonitoringScheduler,
+    "ACTUATOR": ActuatorScheduler,
+    "CRITICAL": OptimumScheduler,
 }
 
 
@@ -51,12 +59,31 @@ class DetectionPipeline:
         distributed_inference=False,
         megadetector_version="MDV5-yolov5",
         deepfaune_version="DFv1.2",
+        use_case="MONITORING",
     ):
         self.detection_device = detection_device
         self.classification_device = classification_device
         self.distributed_inference = distributed_inference
+        self.use_case = use_case
+        self.best_detection_node = None
+        self.best_classification_node = None
+
         if self.distributed_inference:
             ray.init()
+
+            if not (scheduler_cls := USECASE_TO_SCHEDULER.get(use_case)):
+                raise ValueError("Invalid use case: " + use_case)
+            self.scheduler = scheduler_cls()
+            self.best_detection_node, self.best_classification_node = (
+                self.scheduler.best_nodes_det_class()
+            )
+            logger.info(
+                "Selected node for detection: %s, node for classification: %s",
+                self.best_detection_node,
+                self.best_classification_node,
+            )
+            self.detection_device = self.best_detection_node["device"]
+            self.classification_device = self.best_classification_node["device"]
 
         # Initializing the MegaDetectorV5 model for image detection
         logger.info("Initializing detection model to device %s...", self.detection_device)
@@ -80,7 +107,25 @@ class DetectionPipeline:
     def initialize_model(self, cls, *args, **kwargs):
         """Method to initialize model locally or remotely."""
         if self.distributed_inference:
-            return ray.remote(cls).remote(*args, **kwargs)
+            is_detector = cls in NAME_TO_DETECTOR.values()
+            target_node = (
+                self.best_detection_node if is_detector else self.best_classification_node
+            )
+            logger.info(
+                "Initializing %s model remotely on node %s",
+                "detection" if is_detector else "classification",
+                target_node["id_node"],
+            )
+            return (
+                ray.remote(cls)
+                .options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=target_node["id_node"],
+                        soft=False,
+                    )
+                )
+                .remote(*args, **kwargs)
+            )
         return cls(*args, **kwargs)
 
     def run_model(self, fn, *args, **kwargs):
