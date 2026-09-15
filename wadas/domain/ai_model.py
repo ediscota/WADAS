@@ -47,6 +47,7 @@ class AiModel:
     language = "en"
     video_fps = 1
     distributed_inference = False
+    use_case = "MONITORING"
     detection_model_version = "MDV5-yolov5"
     classification_model_version = "DFv1.2"
     tunnel_mode_detection_device = "cpu"
@@ -75,6 +76,7 @@ class AiModel:
             distributed_inference=AiModel.distributed_inference,
             megadetector_version=AiModel.detection_model_version,
             deepfaune_version=AiModel.classification_model_version,
+            use_case=AiModel.use_case,
         )
 
         self.original_image = ""
