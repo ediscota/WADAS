@@ -96,9 +96,16 @@ class Scheduler(ABC):
             f.write(f"Chosen node {node_id} score = {best_score}\n")
 
     def find_nodes(self):
-        """Scan the Ray cluster and return per-node IP, metrics port and resources."""
+        """Scan the Ray cluster and return per-node IP, metrics port and resources.
+
+        Dead nodes are excluded: ray.nodes() keeps recently-departed nodes in
+        its listing (with stale IP/metrics), which would otherwise leave them
+        eligible for selection until Ray eventually forgets them.
+        """
         nodes = {}
         for n in ray.nodes():
+            if not n["Alive"]:
+                continue
             node_id = n["NodeID"]
             nodes[node_id] = {
                 "ip": n["NodeManagerAddress"],
