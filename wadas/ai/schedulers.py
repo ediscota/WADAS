@@ -203,31 +203,33 @@ class MonitoringScheduler(Scheduler):
         npu_selected = False
 
         for node_id, info in nodes.items():
-            cpu_usage, gpu_usage, npu_usage, mem_total, mem_used = self._node_metrics(
-                node_id, info
-            )
+            cpu_usage, gpu_usage, npu_usage, mem_total, mem_used = self._node_metrics(node_id, info)
             mem_ratio = (mem_used / mem_total) if mem_total else 0
+            power = (
+                CPU_POWER_WEIGHT * cpu_usage
+                + GPU_POWER_WEIGHT * gpu_usage
+                + NPU_POWER_WEIGHT * npu_usage
+            )
+            score = power + mem_ratio
 
-            if info["resources"].get("NPU", 0) > 0 and npu_usage == 0:
-                power = CPU_POWER_WEIGHT * cpu_usage + GPU_POWER_WEIGHT * gpu_usage
-                score = power + mem_ratio
+            # The NPU only accelerates detection: classification is GPU/CPU only.
+            npu_free = (
+                role == "DETECTION" and info["resources"].get("NPU", 0) > 0 and npu_usage == 0
+            )
+
+            if npu_free:
                 if not npu_selected or score <= best_score:
                     best_node = {"id_node": node_id, "device": "NPU"}
                     best_score = score
                     npu_selected = True
-            elif not npu_selected:
-                power = CPU_POWER_WEIGHT * cpu_usage + GPU_POWER_WEIGHT * gpu_usage
-                if npu_usage > 0:
-                    power += NPU_POWER_WEIGHT * npu_usage
-                score = power + mem_ratio
-                if score <= best_score:
-                    best_score = score
-                    if gpu_usage <= cpu_usage and info["resources"].get("GPU", 0) > 0:
-                        best_node = {"id_node": node_id, "device": "GPU"}
-                    else:
-                        best_node = {"id_node": node_id, "device": "CPU"}
+            elif not npu_selected and score <= best_score:
+                best_score = score
+                if gpu_usage <= cpu_usage and info["resources"].get("GPU", 0) > 0:
+                    best_node = {"id_node": node_id, "device": "GPU"}
+                else:
+                    best_node = {"id_node": node_id, "device": "CPU"}
 
-            self.save_score(node_id, best_score, role)
+            self.save_score(node_id, score, role)
 
         if best_node:
             self.save_best_score(best_node["id_node"], best_score, role)
@@ -298,7 +300,7 @@ class ActuatorScheduler(Scheduler):
                 best_score = score
                 if gpu_usage < GPU_UTILIZATION_GUARD and info["resources"].get("GPU", 0) > 0:
                     best_node = {"id_node": node_id, "device": "GPU"}
-                elif npu_usage == 0 and info["resources"].get("NPU", 0) > 0:
+                elif role == "DETECTION" and npu_usage == 0 and info["resources"].get("NPU", 0) > 0:
                     best_node = {"id_node": node_id, "device": "NPU"}
                 else:
                     best_node = {"id_node": node_id, "device": "CPU"}
@@ -362,9 +364,17 @@ class OptimumScheduler(Scheduler):
             npu_usage = npu_metrics.get("npu_utilization", 0)
 
         throughput = self.throughput_score(send_speed, receive_speed, capacity_tx, capacity_rx)
-        performance = throughput if read_speed == 0 else throughput + (write_speed / (read_speed + write_speed))
+        performance = (
+            throughput
+            if read_speed == 0
+            else throughput + (write_speed / (read_speed + write_speed))
+        )
 
-        power = CPU_POWER_WEIGHT * cpu_usage + GPU_POWER_WEIGHT * gpu_usage + NPU_POWER_WEIGHT * npu_usage
+        power = (
+            CPU_POWER_WEIGHT * cpu_usage
+            + GPU_POWER_WEIGHT * gpu_usage
+            + NPU_POWER_WEIGHT * npu_usage
+        )
         watt = power + ((mem_used / mem_total) if mem_total else 0)
 
         return performance / watt if watt else 0, cpu_usage, gpu_usage, npu_usage
@@ -381,7 +391,7 @@ class OptimumScheduler(Scheduler):
                 has_gpu = info["resources"].get("GPU", 0) > 0
                 has_npu = info["resources"].get("NPU", 0) > 0
 
-                if has_npu and npu_usage == 0:
+                if role == "DETECTION" and has_npu and npu_usage == 0:
                     best_device = "NPU"
                 elif has_gpu:
                     usage_by_device = {"CPU": cpu_usage, "GPU": gpu_usage}
