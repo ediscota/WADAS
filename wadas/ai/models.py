@@ -492,6 +492,12 @@ class OVMegaDetectorV5(pw_detection.MegaDetectorV5, WadasAiModel):
             target_size=self.IMAGE_SIZE, stride=self.STRIDE
         )
 
+    def __repr__(self):
+        # nn.Module.__repr__ (inherited via pw_detection.MegaDetectorV5) needs
+        # self._modules, which is never set since we skip nn.Module.__init__ on
+        # purpose (inference runs through OpenVINO, not the PyTorch graph).
+        return f"{type(self).__name__}(device={self.device!r})"
+
     def run(self, img_array: np.ndarray, detection_threshold: float):
         """Run detection model"""
         return self.single_image_detection(img_array, None, detection_threshold, None)
@@ -528,6 +534,12 @@ class OVMegaDetectorV6(pw_detection.MegaDetectorV6, WadasAiModel, ABC):
         self.predictor.args.save = (
             False  # Will see if we want to use ultralytics native inference saving functions.
         )
+
+    def __repr__(self):
+        # nn.Module.__repr__ (inherited via pw_detection.MegaDetectorV6) needs
+        # self._modules, which is never set since we skip nn.Module.__init__ on
+        # purpose (inference runs through OpenVINO, not the PyTorch graph).
+        return f"{type(self).__name__}(device={self.device!r})"
 
     def run(self, img_array: np.ndarray, detection_threshold: float):
         """Run detection model"""
