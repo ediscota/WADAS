@@ -61,3 +61,12 @@ def test_summary_reports_mean_per_kind(capsys):
     assert "MONITORING video: 2/2 tasks ok" in out
     assert "mean 15.0" in out
     assert "MONITORING photo: 1/1 tasks ok" in out
+
+
+def test_only_photos_does_not_add_a_video():
+    args = parse_args(["--n-photos", "10"])
+    assert (args.n_videos, args.n_photos) == (0, 10)
+
+
+def test_default_is_one_video():
+    assert parse_args([]).n_videos == 1

@@ -83,7 +83,7 @@ def parse_args(argv=None):
     parser.add_argument("--use-cases", nargs="+", choices=USE_CASES, default=list(USE_CASES))
     parser.add_argument("--photos-dir", type=Path, default=Path.home() / "PHOTO_TEST")
     parser.add_argument(
-        "--n-tasks", type=int, default=1, help="Video tasks, if --n-videos is unset"
+        "--n-tasks", type=int, default=None, help="Video tasks, if --n-videos is unset"
     )
     parser.add_argument("--n-videos", type=int, default=None, help="Video tasks per scenario")
     parser.add_argument("--n-photos", type=int, default=0, help="Photo tasks per scenario")
@@ -99,7 +99,8 @@ def parse_args(argv=None):
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
     args = parser.parse_args(argv)
     if args.n_videos is None:
-        args.n_videos = args.n_tasks
+        # --n-tasks keeps meaning "videos"; asking only for photos must not add a video.
+        args.n_videos = args.n_tasks if args.n_tasks is not None else (0 if args.n_photos else 1)
     if args.n_videos < 0 or args.n_photos < 0 or args.n_videos + args.n_photos == 0:
         parser.error("need at least one video or photo task")
     return args
