@@ -10,6 +10,7 @@ Usually launched by run_scenario.py, one process per task.
 import argparse
 import json
 import os
+import shutil
 import socket
 import statistics
 import sys
@@ -25,7 +26,8 @@ USE_CASES = ("MONITORING", "ACTUATOR", "CRITICAL")
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--video", required=True)
+    parser.add_argument("--video", required=True, help="Media file (a photo with --kind photo)")
+    parser.add_argument("--kind", choices=("video", "photo"), default="video")
     parser.add_argument("--use-case", required=True, choices=USE_CASES)
     parser.add_argument("--out-dir", required=True, help="Task working dir; result.json goes here")
     parser.add_argument("--task-id", default="0")
@@ -86,9 +88,21 @@ def run_task(args, video, row):
         pipeline.run_detection = timed(pipeline.run_detection, det_latencies)
         pipeline.classify = timed(pipeline.classify, cls_latencies)
 
-        t1 = time.perf_counter()
-        detections = list(ai_model.process_video(str(video), True))
-        t_detection = time.perf_counter() - t1
+        if args.kind == "photo":
+            # process_image blurs the file in place and deletes it when no animal is found,
+            # so it must work on a copy of the shared photo.
+            copy = Path.cwd() / f"photo_{args.task_id}{video.suffix}"
+            shutil.copyfile(video, copy)
+            t1 = time.perf_counter()
+            results, detected_img_path = ai_model.process_image(str(copy), True)
+            t_detection = time.perf_counter() - t1
+            if results is None:
+                raise RuntimeError(f"process_image could not process {video.name}")
+            detections = [(results, detected_img_path, None)] if detected_img_path else []
+        else:
+            t1 = time.perf_counter()
+            detections = list(ai_model.process_video(str(video), True))
+            t_detection = time.perf_counter() - t1
 
         t2 = time.perf_counter()
         for results, detected_img_path, _ in detections:
@@ -129,6 +143,7 @@ def main(argv=None):
     row = {
         "task_id": args.task_id,
         "use_case": args.use_case,
+        "kind": args.kind,
         "video": video.name,
         "status": "error",
     }
