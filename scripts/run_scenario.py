@@ -10,6 +10,8 @@ Run it on the Ray head node, with the cluster and the per-node exporters already
   --n-tasks 5 --repeats 3                  same load on every scheduler, in random order
   --n-videos 10 --n-photos 10 --stagger 0 --repeats 10
                                            10 videos and 10 photos arriving together
+  --n-photos 10 --stagger 0 --scheduler-params '{"pending_penalty": 20}'
+                                           same, with the schedulers counting recent placements
 
 Task i of each kind always uses media i (cycling through the sorted files), so every use
 case is compared on the same workload. Photos come from --photos-dir (see extract_photos.py).
@@ -42,6 +44,7 @@ TASK_FIELDS = [
     "stagger_s",
     "task_id",
     "kind",
+    "scheduler_params",
     "video",
     "status",
     "error",
@@ -81,6 +84,11 @@ def parse_args(argv=None):
     )
     parser.add_argument("--videos-dir", type=Path, default=Path.home() / "VIDEO_TEST")
     parser.add_argument("--use-cases", nargs="+", choices=USE_CASES, default=list(USE_CASES))
+    parser.add_argument(
+        "--scheduler-params",
+        default="{}",
+        help="JSON with scheduler options, e.g. '{\"pending_penalty\": 20}'",
+    )
     parser.add_argument("--photos-dir", type=Path, default=Path.home() / "PHOTO_TEST")
     parser.add_argument(
         "--n-tasks", type=int, default=None, help="Video tasks, if --n-videos is unset"
@@ -101,6 +109,10 @@ def parse_args(argv=None):
     if args.n_videos is None:
         # --n-tasks keeps meaning "videos"; asking only for photos must not add a video.
         args.n_videos = args.n_tasks if args.n_tasks is not None else (0 if args.n_photos else 1)
+    try:
+        json.loads(args.scheduler_params)
+    except ValueError:
+        parser.error("--scheduler-params is not valid JSON")
     if args.n_videos < 0 or args.n_photos < 0 or args.n_videos + args.n_photos == 0:
         parser.error("need at least one video or photo task")
     return args
@@ -162,6 +174,8 @@ def launch_task(args, kind, media, use_case, index, task_dir):
         kind,
         "--use-case",
         use_case,
+        "--scheduler-params",
+        args.scheduler_params,
         "--task-id",
         str(index),
         "--out-dir",

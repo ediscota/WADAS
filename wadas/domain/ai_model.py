@@ -48,6 +48,7 @@ class AiModel:
     video_fps = 1
     distributed_inference = False
     use_case = "MONITORING"
+    scheduler_params = {}
     detection_model_version = "MDV5-yolov5"
     classification_model_version = "DFv1.2"
     tunnel_mode_detection_device = "cpu"
@@ -77,6 +78,7 @@ class AiModel:
             megadetector_version=AiModel.detection_model_version,
             deepfaune_version=AiModel.classification_model_version,
             use_case=AiModel.use_case,
+            scheduler_params=AiModel.scheduler_params,
         )
 
         self.original_image = ""

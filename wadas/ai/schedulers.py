@@ -26,6 +26,8 @@ from pathlib import Path
 import ray
 import requests
 
+from wadas.ai.pending_load import PendingLoad, read_pending, reserve
+
 logger = logging.getLogger(__name__)
 
 # Correspondence between the scheduler class, the use-case string used in
@@ -58,18 +60,36 @@ MEMORY_USAGE_GUARD = 0.55
 # GPU utilization above this percentage is considered saturated.
 GPU_UTILIZATION_GUARD = 75.0
 
+# How long a placement decision keeps counting as pending load (seconds): the models it
+# creates only show up in the node metrics a few seconds after the decision.
+DEFAULT_PENDING_TTL = 10.0
+
 
 class Scheduler(ABC):
     """Base class for Ray cluster node schedulers.
 
-    Subclasses implement `best_nodes_det_class()` to select, among the nodes
-    of the Ray cluster, the best node/device pair for running the detection
-    model and the best node/device pair for running the classification model.
+    Subclasses implement `_best_node()` to select, among the nodes of the Ray
+    cluster, the best node/device pair for one model; `best_nodes_det_class()`
+    uses it for the detection and for the classification model.
+
+    `pending_penalty` (0 = off) makes a scheduler count the placements decided in the
+    last `pending_ttl` seconds, which the node metrics do not show yet: each of them
+    worsens the score of its node by `pending_penalty`, in the unit of that scheduler's
+    score, and a node whose NPU was just assigned no longer counts as having a free NPU.
     """
 
-    def __init__(self, save_scores: bool = False, scores_path: str | Path | None = None):
+    def __init__(
+        self,
+        save_scores: bool = False,
+        scores_path: str | Path | None = None,
+        pending_penalty: float = 0.0,
+        pending_ttl: float = DEFAULT_PENDING_TTL,
+    ):
         self.save_scores = save_scores
         self.scores_path = Path(scores_path) if scores_path else None
+        self.pending_penalty = pending_penalty
+        self.pending_ttl = pending_ttl
+        self._pending = PendingLoad()
 
     def save_score(self, node_id, score, model):
         """Append a node score to the scores file, if score saving is enabled."""
@@ -159,12 +179,33 @@ class Scheduler(ABC):
         receive_ratio = min(max(receive_speed / capacity_rx, 0), 1) if capacity_rx else 1
         return ALPHA * (1 - send_ratio) + BETA * (1 - receive_ratio)
 
-    @abstractmethod
-    def best_nodes_det_class(self):
-        """Return (best_detection_node, best_classification_node).
+    def pending_on_node(self, node_id):
+        """Placements decided recently on this node, weighted by `pending_penalty`."""
+        return self.pending_penalty * self._pending.on_node(node_id)
 
-        Each is a dict {"id_node": <ray node id>, "device": "CPU"|"GPU"|"NPU"}.
-        """
+    def npu_is_pending(self, node_id):
+        """Whether a model was just assigned to the NPU of this node."""
+        return self._pending.on_device(node_id, "NPU") > 0
+
+    @abstractmethod
+    def _best_node(self, nodes, role):
+        """Return {"id_node": <ray node id>, "device": "CPU"|"GPU"|"NPU"} for one model."""
+
+    def best_nodes_det_class(self):
+        """Return (best_detection_node, best_classification_node), each a dict as above."""
+        nodes = self.find_nodes()
+        if self.pending_penalty > 0:
+            self._pending = read_pending()
+        best_detection = self._best_node(nodes, "DETECTION")
+        best_classification = self._best_node(nodes, "CLASSIFICATION")
+        if self.pending_penalty > 0:
+            for node, role in (
+                (best_detection, "DETECTION"),
+                (best_classification, "CLASSIFICATION"),
+            ):
+                if node:
+                    reserve(node["id_node"], node["device"], role, self.pending_ttl)
+        return best_detection, best_classification
 
 
 class MonitoringScheduler(Scheduler):
@@ -210,11 +251,14 @@ class MonitoringScheduler(Scheduler):
                 + GPU_POWER_WEIGHT * gpu_usage
                 + NPU_POWER_WEIGHT * npu_usage
             )
-            score = power + mem_ratio
+            score = power + mem_ratio + self.pending_on_node(node_id)
 
             # The NPU only accelerates detection: classification is GPU/CPU only.
             npu_free = (
-                role == "DETECTION" and info["resources"].get("NPU", 0) > 0 and npu_usage == 0
+                role == "DETECTION"
+                and info["resources"].get("NPU", 0) > 0
+                and npu_usage == 0
+                and not self.npu_is_pending(node_id)
             )
 
             if npu_free:
@@ -234,12 +278,6 @@ class MonitoringScheduler(Scheduler):
         if best_node:
             self.save_best_score(best_node["id_node"], best_score, role)
         return best_node
-
-    def best_nodes_det_class(self):
-        nodes = self.find_nodes()
-        best_detection = self._best_node(nodes, "DETECTION")
-        best_classification = self._best_node(nodes, "CLASSIFICATION")
-        return best_detection, best_classification
 
 
 class ActuatorScheduler(Scheduler):
@@ -291,16 +329,24 @@ class ActuatorScheduler(Scheduler):
 
     def _best_node(self, nodes, role):
         best_node = {}
-        best_score = 0.0
+        # Pending placements can push the score below zero, which must not rule a node out.
+        best_score = float("-inf")
 
         for node_id, info in nodes.items():
             score, gpu_usage, npu_usage, mem_ratio = self._node_metrics(node_id, info)
+            score -= self.pending_on_node(node_id)
 
             if score >= best_score and mem_ratio < MEMORY_USAGE_GUARD:
                 best_score = score
+                npu_free = (
+                    role == "DETECTION"
+                    and info["resources"].get("NPU", 0) > 0
+                    and npu_usage == 0
+                    and not self.npu_is_pending(node_id)
+                )
                 if gpu_usage < GPU_UTILIZATION_GUARD and info["resources"].get("GPU", 0) > 0:
                     best_node = {"id_node": node_id, "device": "GPU"}
-                elif role == "DETECTION" and npu_usage == 0 and info["resources"].get("NPU", 0) > 0:
+                elif npu_free:
                     best_node = {"id_node": node_id, "device": "NPU"}
                 else:
                     best_node = {"id_node": node_id, "device": "CPU"}
@@ -310,12 +356,6 @@ class ActuatorScheduler(Scheduler):
         if best_node:
             self.save_best_score(best_node["id_node"], best_score, role)
         return best_node
-
-    def best_nodes_det_class(self):
-        nodes = self.find_nodes()
-        best_detection = self._best_node(nodes, "DETECTION")
-        best_classification = self._best_node(nodes, "CLASSIFICATION")
-        return best_detection, best_classification
 
 
 class OptimumScheduler(Scheduler):
@@ -375,7 +415,7 @@ class OptimumScheduler(Scheduler):
             + GPU_POWER_WEIGHT * gpu_usage
             + NPU_POWER_WEIGHT * npu_usage
         )
-        watt = power + ((mem_used / mem_total) if mem_total else 0)
+        watt = power + ((mem_used / mem_total) if mem_total else 0) + self.pending_on_node(node_id)
 
         return performance / watt if watt else 0, cpu_usage, gpu_usage, npu_usage
 
@@ -391,7 +431,12 @@ class OptimumScheduler(Scheduler):
                 has_gpu = info["resources"].get("GPU", 0) > 0
                 has_npu = info["resources"].get("NPU", 0) > 0
 
-                if role == "DETECTION" and has_npu and npu_usage == 0:
+                if (
+                    role == "DETECTION"
+                    and has_npu
+                    and npu_usage == 0
+                    and not self.npu_is_pending(node_id)
+                ):
                     best_device = "NPU"
                 elif has_gpu:
                     usage_by_device = {"CPU": cpu_usage, "GPU": gpu_usage}
@@ -405,9 +450,3 @@ class OptimumScheduler(Scheduler):
         if best_node:
             self.save_best_score(best_node["id_node"], best_score, role)
         return best_node
-
-    def best_nodes_det_class(self):
-        nodes = self.find_nodes()
-        best_detection = self._best_node(nodes, "DETECTION")
-        best_classification = self._best_node(nodes, "CLASSIFICATION")
-        return best_detection, best_classification

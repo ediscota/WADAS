@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 
 import pytest
 
+from wadas.ai.pending_load import PendingLoad
 from wadas.ai.schedulers import (
     ActuatorScheduler,
     MonitoringScheduler,
@@ -108,3 +109,103 @@ def test_monitoring_saves_each_nodes_own_score(cluster, tmp_path):
     node_scores = re.findall(r"^Node (\S+) score = (\S+)$", scores_file.read_text(), re.M)
     assert {node_id for node_id, _ in node_scores} == {"light", "busy"}
     assert len({score for _, score in node_scores}) == 2
+
+
+# --- pending load: placements decided but not yet visible in the node metrics ---
+
+# Penalty per pending placement, in the unit of each scheduler's score.
+PENALTY = {MonitoringScheduler: 20.0, ActuatorScheduler: 0.05, OptimumScheduler: 20.0}
+
+
+def two_nodes(cluster):
+    cluster["10.0.0.1"] = idle(cpu=5.0, net=1e4)  # preferred by every scheduler when idle
+    cluster["10.0.0.2"] = idle(cpu=6.0, net=2e4)
+    return [
+        ray_node("a", "10.0.0.1", {"CPU": 6, "GPU": 1}),
+        ray_node("b", "10.0.0.2", {"CPU": 6, "GPU": 1}),
+    ]
+
+
+@pytest.mark.parametrize("scheduler_cls", ALL_SCHEDULERS)
+def test_pending_load_is_ignored_unless_enabled(cluster, scheduler_cls):
+    nodes = two_nodes(cluster)
+
+    with (
+        patch("wadas.ai.schedulers.ray.nodes", return_value=nodes),
+        patch("wadas.ai.schedulers.read_pending") as read_pending,
+        patch("wadas.ai.schedulers.reserve") as reserve,
+    ):
+        detection, _ = scheduler_cls().best_nodes_det_class()
+
+    assert detection["id_node"] == "a"
+    read_pending.assert_not_called()
+    reserve.assert_not_called()
+
+
+@pytest.mark.parametrize("scheduler_cls", ALL_SCHEDULERS)
+def test_a_node_with_pending_placements_is_avoided(cluster, scheduler_cls):
+    nodes = two_nodes(cluster)
+    pending = PendingLoad([("a", "GPU", "DETECTION")])
+
+    with (
+        patch("wadas.ai.schedulers.ray.nodes", return_value=nodes),
+        patch("wadas.ai.schedulers.read_pending", return_value=pending),
+        patch("wadas.ai.schedulers.reserve"),
+    ):
+        detection, classification = scheduler_cls(
+            pending_penalty=PENALTY[scheduler_cls]
+        ).best_nodes_det_class()
+
+    assert detection["id_node"] == "b"
+    assert classification["id_node"] == "b"
+
+
+@pytest.mark.parametrize("scheduler_cls", ALL_SCHEDULERS)
+def test_decisions_are_recorded_with_the_configured_ttl(cluster, scheduler_cls):
+    nodes = two_nodes(cluster)
+
+    with (
+        patch("wadas.ai.schedulers.ray.nodes", return_value=nodes),
+        patch("wadas.ai.schedulers.read_pending", return_value=PendingLoad()),
+        patch("wadas.ai.schedulers.reserve") as reserve,
+    ):
+        scheduler_cls(
+            pending_penalty=PENALTY[scheduler_cls], pending_ttl=7.0
+        ).best_nodes_det_class()
+
+    recorded = [(call.args[0], call.args[2], call.args[3]) for call in reserve.call_args_list]
+    assert recorded == [("a", "DETECTION", 7.0), ("a", "CLASSIFICATION", 7.0)]
+
+
+@pytest.mark.parametrize("scheduler_cls", ALL_SCHEDULERS)
+def test_a_pending_npu_assignment_makes_the_npu_busy(cluster, scheduler_cls):
+    cluster["10.0.0.1"] = idle()
+    nodes = [ray_node("npu-node", "10.0.0.1", {"CPU": 6, "NPU": 1})]
+
+    def detection_device(pending):
+        with (
+            patch("wadas.ai.schedulers.ray.nodes", return_value=nodes),
+            patch("wadas.ai.schedulers.read_pending", return_value=pending),
+            patch("wadas.ai.schedulers.reserve"),
+        ):
+            detection, _ = scheduler_cls(
+                pending_penalty=PENALTY[scheduler_cls]
+            ).best_nodes_det_class()
+        return detection["device"]
+
+    assert detection_device(PendingLoad()) == "NPU"
+    assert detection_device(PendingLoad([("npu-node", "NPU", "DETECTION")])) == "CPU"
+
+
+def test_actuator_still_answers_when_pending_placements_push_scores_below_zero(cluster):
+    nodes = two_nodes(cluster)
+    pending = PendingLoad([("a", "GPU", "DETECTION")] * 40 + [("b", "GPU", "DETECTION")] * 40)
+
+    with (
+        patch("wadas.ai.schedulers.ray.nodes", return_value=nodes),
+        patch("wadas.ai.schedulers.read_pending", return_value=pending),
+        patch("wadas.ai.schedulers.reserve"),
+    ):
+        detection, _ = ActuatorScheduler(pending_penalty=0.05).best_nodes_det_class()
+
+    assert detection["id_node"] in ("a", "b")

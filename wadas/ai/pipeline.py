@@ -60,6 +60,7 @@ class DetectionPipeline:
         megadetector_version="MDV5-yolov5",
         deepfaune_version="DFv1.2",
         use_case="MONITORING",
+        scheduler_params=None,
     ):
         self.detection_device = detection_device
         self.classification_device = classification_device
@@ -73,7 +74,7 @@ class DetectionPipeline:
 
             if not (scheduler_cls := USECASE_TO_SCHEDULER.get(use_case)):
                 raise ValueError("Invalid use case: " + use_case)
-            self.scheduler = scheduler_cls()
+            self.scheduler = scheduler_cls(**(scheduler_params or {}))
             self.best_detection_node, self.best_classification_node = (
                 self.scheduler.best_nodes_det_class()
             )
@@ -112,9 +113,7 @@ class DetectionPipeline:
         """Method to initialize model locally or remotely."""
         if self.distributed_inference:
             is_detector = cls in NAME_TO_DETECTOR.values()
-            target_node = (
-                self.best_detection_node if is_detector else self.best_classification_node
-            )
+            target_node = self.best_detection_node if is_detector else self.best_classification_node
             logger.info(
                 "Initializing %s model remotely on node %s",
                 "detection" if is_detector else "classification",

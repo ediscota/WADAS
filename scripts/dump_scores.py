@@ -60,7 +60,7 @@ RAW_FIELDS = (
 class Reader(Scheduler):
     """A scheduler that only exposes the metric reading of the base class."""
 
-    def best_nodes_det_class(self):
+    def _best_node(self, nodes, role):
         raise NotImplementedError
 
 

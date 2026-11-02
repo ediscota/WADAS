@@ -29,6 +29,11 @@ def parse_args(argv=None):
     parser.add_argument("--video", required=True, help="Media file (a photo with --kind photo)")
     parser.add_argument("--kind", choices=("video", "photo"), default="video")
     parser.add_argument("--use-case", required=True, choices=USE_CASES)
+    parser.add_argument(
+        "--scheduler-params",
+        default="{}",
+        help="JSON with scheduler options, e.g. '{\"pending_penalty\": 20}'",
+    )
     parser.add_argument("--out-dir", required=True, help="Task working dir; result.json goes here")
     parser.add_argument("--task-id", default="0")
     parser.add_argument("--fps", type=int, default=1, help="Video frames sampled per second")
@@ -61,6 +66,7 @@ def run_task(args, video, row):
     try:
         AiModel.distributed_inference = True
         AiModel.use_case = args.use_case
+        AiModel.scheduler_params = json.loads(args.scheduler_params)
         AiModel.video_fps = args.fps
 
         started_at = time.time()
@@ -144,6 +150,7 @@ def main(argv=None):
         "task_id": args.task_id,
         "use_case": args.use_case,
         "kind": args.kind,
+        "scheduler_params": args.scheduler_params,
         "video": video.name,
         "status": "error",
     }
