@@ -263,8 +263,23 @@ def print_summary(rows):
             print(f"  {label} placement: {counts}")
 
 
+def prepare_pending_registry():
+    """Create the shared pending-load registry now: the first call creates it, which takes a
+    second or two, and tasks launched together would all wait for it and then read it empty."""
+    import ray
+
+    sys.path.insert(0, str(REPO_ROOT))
+    from wadas.ai.pending_load import read_pending
+
+    ray.init(address="auto", logging_level="ERROR")
+    read_pending()
+    ray.shutdown()
+
+
 def main(argv=None):
     args = parse_args(argv)
+    if json.loads(args.scheduler_params).get("pending_penalty", 0) > 0:
+        prepare_pending_registry()
     videos = sorted(args.videos_dir.expanduser().glob("*.mp4"))
     if args.n_videos and not videos:
         sys.exit(f"No .mp4 files found in {args.videos_dir}")

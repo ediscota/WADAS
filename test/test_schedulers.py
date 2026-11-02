@@ -209,3 +209,42 @@ def test_actuator_still_answers_when_pending_placements_push_scores_below_zero(c
         detection, _ = ActuatorScheduler(pending_penalty=0.05).best_nodes_det_class()
 
     assert detection["id_node"] in ("a", "b")
+
+
+@pytest.mark.parametrize("scheduler_cls", ALL_SCHEDULERS)
+def test_metrics_are_read_once_per_node_for_both_models(cluster, scheduler_cls):
+    nodes = two_nodes(cluster)
+    original = scheduler_cls._node_metrics
+
+    with (
+        patch("wadas.ai.schedulers.ray.nodes", return_value=nodes),
+        patch.object(scheduler_cls, "_node_metrics", autospec=True, side_effect=original) as spy,
+    ):
+        scheduler_cls().best_nodes_det_class()
+
+    assert spy.call_count == len(nodes)
+
+
+@pytest.mark.parametrize("scheduler_cls", ALL_SCHEDULERS)
+def test_pending_load_is_read_after_the_metrics(cluster, scheduler_cls):
+    nodes = two_nodes(cluster)
+    events = []
+    original = scheduler_cls._node_metrics
+
+    def record_metrics(self, node_id, info):
+        events.append("metrics")
+        return original(self, node_id, info)
+
+    def record_pending():
+        events.append("pending")
+        return PendingLoad()
+
+    with (
+        patch("wadas.ai.schedulers.ray.nodes", return_value=nodes),
+        patch.object(scheduler_cls, "_node_metrics", autospec=True, side_effect=record_metrics),
+        patch("wadas.ai.schedulers.read_pending", side_effect=record_pending),
+        patch("wadas.ai.schedulers.reserve"),
+    ):
+        scheduler_cls(pending_penalty=PENALTY[scheduler_cls]).best_nodes_det_class()
+
+    assert events == ["metrics"] * len(nodes) + ["pending"]

@@ -81,7 +81,9 @@ def _registry():
 def read_pending():
     """Read the recent decisions; on any failure behave as if there were none."""
     try:
-        entries = ray.get(_registry().snapshot.remote(), timeout=REGISTRY_TIMEOUT)
+        # Keep the handle in a variable: a method only holds a weak reference to its actor.
+        registry = _registry()
+        entries = ray.get(registry.snapshot.remote(), timeout=REGISTRY_TIMEOUT)
     except Exception as exc:  # noqa: BLE001 - a broken registry must not stop scheduling
         logger.warning("Pending-load registry unavailable, ignoring it: %s", exc)
         return PendingLoad()
@@ -91,6 +93,7 @@ def read_pending():
 def reserve(node_id, device, role, ttl):
     """Record a decision so that the next ones see it."""
     try:
-        ray.get(_registry().add.remote(node_id, device, role, ttl), timeout=REGISTRY_TIMEOUT)
+        registry = _registry()
+        ray.get(registry.add.remote(node_id, device, role, ttl), timeout=REGISTRY_TIMEOUT)
     except Exception as exc:  # noqa: BLE001 - a broken registry must not stop scheduling
         logger.warning("Could not record the placement decision: %s", exc)

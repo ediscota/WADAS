@@ -90,6 +90,14 @@ class Scheduler(ABC):
         self.pending_penalty = pending_penalty
         self.pending_ttl = pending_ttl
         self._pending = PendingLoad()
+        self._metrics_cache = {}
+
+    def _metrics(self, node_id, info):
+        """Node metrics read once per decision: the same reading serves detection and
+        classification, and it is taken before the pending load is read (see below)."""
+        if node_id not in self._metrics_cache:
+            self._metrics_cache[node_id] = self._node_metrics(node_id, info)
+        return self._metrics_cache[node_id]
 
     def save_score(self, node_id, score, model):
         """Append a node score to the scores file, if score saving is enabled."""
@@ -194,7 +202,13 @@ class Scheduler(ABC):
     def best_nodes_det_class(self):
         """Return (best_detection_node, best_classification_node), each a dict as above."""
         nodes = self.find_nodes()
+        self._metrics_cache = {}
         if self.pending_penalty > 0:
+            # Reading the metrics takes a few hundred ms. The pending load is read only after
+            # it, and the decision is recorded right after taking it: requests arriving
+            # together would otherwise all read the same empty record.
+            for node_id, info in nodes.items():
+                self._metrics(node_id, info)
             self._pending = read_pending()
         best_detection = self._best_node(nodes, "DETECTION")
         best_classification = self._best_node(nodes, "CLASSIFICATION")
@@ -244,7 +258,7 @@ class MonitoringScheduler(Scheduler):
         npu_selected = False
 
         for node_id, info in nodes.items():
-            cpu_usage, gpu_usage, npu_usage, mem_total, mem_used = self._node_metrics(node_id, info)
+            cpu_usage, gpu_usage, npu_usage, mem_total, mem_used = self._metrics(node_id, info)
             mem_ratio = (mem_used / mem_total) if mem_total else 0
             power = (
                 CPU_POWER_WEIGHT * cpu_usage
@@ -333,7 +347,7 @@ class ActuatorScheduler(Scheduler):
         best_score = float("-inf")
 
         for node_id, info in nodes.items():
-            score, gpu_usage, npu_usage, mem_ratio = self._node_metrics(node_id, info)
+            score, gpu_usage, npu_usage, mem_ratio = self._metrics(node_id, info)
             score -= self.pending_on_node(node_id)
 
             if score >= best_score and mem_ratio < MEMORY_USAGE_GUARD:
@@ -415,16 +429,18 @@ class OptimumScheduler(Scheduler):
             + GPU_POWER_WEIGHT * gpu_usage
             + NPU_POWER_WEIGHT * npu_usage
         )
-        watt = power + ((mem_used / mem_total) if mem_total else 0) + self.pending_on_node(node_id)
+        watt = power + ((mem_used / mem_total) if mem_total else 0)
 
-        return performance / watt if watt else 0, cpu_usage, gpu_usage, npu_usage
+        return performance, watt, cpu_usage, gpu_usage, npu_usage
 
     def _best_node(self, nodes, role):
         best_node = {}
         best_score = 0.0
 
         for node_id, info in nodes.items():
-            score, cpu_usage, gpu_usage, npu_usage = self._node_metrics(node_id, info)
+            performance, watt, cpu_usage, gpu_usage, npu_usage = self._metrics(node_id, info)
+            watt += self.pending_on_node(node_id)
+            score = performance / watt if watt else 0
 
             if score >= best_score:
                 best_score = score

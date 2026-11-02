@@ -51,3 +51,41 @@ def test_an_unreachable_registry_is_ignored():
 @pytest.mark.parametrize("empty", [(), []])
 def test_empty_snapshot(empty):
     assert PendingLoad(empty).on_node("anything") == 0
+
+
+class FakeRemote:
+    def __init__(self, result, log):
+        self._result = result
+        self._log = log
+
+    def remote(self, *args):
+        self._log.append(args)
+        return self._result
+
+
+class FakeRegistry:
+    def __init__(self, entries):
+        self.log = []
+        self.snapshot = FakeRemote(entries, self.log)
+        self.add = FakeRemote(None, self.log)
+
+
+def test_read_pending_goes_through_the_registry():
+    registry = FakeRegistry([("n1", "GPU", "DETECTION"), ("n1", "NPU", "DETECTION")])
+    with (
+        patch.object(pending_load, "_registry", return_value=registry),
+        patch.object(pending_load.ray, "get", side_effect=lambda ref, timeout=None: ref),
+    ):
+        load = read_pending()
+    assert load.on_node("n1") == 2
+    assert load.on_device("n1", "NPU") == 1
+
+
+def test_reserve_sends_the_decision_to_the_registry():
+    registry = FakeRegistry([])
+    with (
+        patch.object(pending_load, "_registry", return_value=registry),
+        patch.object(pending_load.ray, "get", side_effect=lambda ref, timeout=None: ref),
+    ):
+        reserve("n1", "GPU", "DETECTION", ttl=10)
+    assert registry.log == [("n1", "GPU", "DETECTION", 10)]
