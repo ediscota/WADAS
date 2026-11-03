@@ -1,0 +1,9 @@
+{
+  "wadas1:NPU": {"DETECTION": 22.4},
+  "wadas1:GPU": {"DETECTION": 30.7, "CLASSIFICATION": 30.9},
+  "wadas2:NPU": {"DETECTION": 22.4},
+  "wadas2:GPU": {"DETECTION": 30.7, "CLASSIFICATION": 30.9},
+  "wadas3:GPU": {"DETECTION": 106.5, "CLASSIFICATION": 51.2},
+  "wadas4:GPU": {"DETECTION": 91.5, "CLASSIFICATION": 57.6},
+  "wadas5:GPU": {"DETECTION": 99.0, "CLASSIFICATION": 54.4}
+}

@@ -48,8 +48,8 @@ def energy_between(before, after):
 
 
 def measure_idle_watts(hosts, seconds, **kwargs):
-    """Mean cluster power over `seconds` while nothing is running, or None."""
+    """Mean power of every host over `seconds` while nothing is running: {host: watts} or None."""
     before = read_energy(hosts, **kwargs)
     time.sleep(seconds)
-    _, joules = energy_between(before, read_energy(hosts, **kwargs))
-    return None if joules is None else joules / seconds
+    per_node, _ = energy_between(before, read_energy(hosts, **kwargs))
+    return None if per_node is None else {host: j / seconds for host, j in per_node.items()}

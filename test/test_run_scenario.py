@@ -89,3 +89,26 @@ def test_energy_summary_reports_energy_per_task(capsys):
     out = capsys.readouterr().out
     assert "MONITORING energy: scenario mean 600 J (400 J above idle), 40.0 J per task" in out
     assert "CRITICAL" not in out
+
+
+def test_energy_summary_reports_the_mean_per_node(capsys):
+    from run_scenario import print_energy_summary
+
+    rows = [
+        {
+            "use_case": "MONITORING",
+            "n_tasks": 10,
+            "energy_j": 300.0,
+            "energy_active_j": 200.0,
+            "energy_by_node_j": '{"wadas1": 100.0, "wadas3": 200.0}',
+        },
+        {
+            "use_case": "MONITORING",
+            "n_tasks": 10,
+            "energy_j": 500.0,
+            "energy_active_j": 400.0,
+            "energy_by_node_j": '{"wadas1": 300.0, "wadas3": 200.0}',
+        },
+    ]
+    print_energy_summary(rows)
+    assert "per node (mean J per scenario): wadas1 200, wadas3 200" in capsys.readouterr().out

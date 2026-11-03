@@ -18,6 +18,7 @@
 # exposed by Ray and by the per-node exporters in wadas.ai.gpu_exporter,
 # wadas.ai.npu_exporter and wadas.ai.network_exporter.
 
+import json
 import logging
 import re
 from abc import ABC, abstractmethod
@@ -137,6 +138,7 @@ class Scheduler(ABC):
             node_id = n["NodeID"]
             nodes[node_id] = {
                 "ip": n["NodeManagerAddress"],
+                "hostname": n.get("NodeManagerHostname"),
                 "metric_port": n["MetricsExportPort"],
                 "resources": n["Resources"],
             }
@@ -222,9 +224,27 @@ class Scheduler(ABC):
         return best_detection, best_classification
 
 
+def load_energy_profile(profile):
+    """Return {"host:DEVICE": {"DETECTION": joules, "CLASSIFICATION": joules}}, from a dict or
+    from the path of a JSON file, or None."""
+    if isinstance(profile, (str, Path)):
+        return json.loads(Path(profile).read_text())
+    return profile or None
+
+
 class MonitoringScheduler(Scheduler):
     """Picks nodes minimizing estimated power consumption, favoring NPU/CPU
-    over GPU: suited for continuous, low-power monitoring workloads."""
+    over GPU: suited for continuous, low-power monitoring workloads.
+
+    With `energy_profile` (the measured energy of one task on each node and device, see
+    scripts/energy_profile.json) it picks the node/device where the task costs the least
+    energy, instead of estimating power from the device loads. Use it with `pending_penalty`
+    (here in joules): the cheapest device alone would receive every request of a burst.
+    """
+
+    def __init__(self, *args, energy_profile=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.energy_profile = load_energy_profile(energy_profile)
 
     target_metrics = {
         "ray_node_cpu_utilization",
@@ -253,6 +273,44 @@ class MonitoringScheduler(Scheduler):
         return cpu_usage, gpu_usage, npu_usage, mem_total, mem_used
 
     def _best_node(self, nodes, role):
+        if self.energy_profile:
+            if best_node := self._best_node_by_energy(nodes, role):
+                return best_node
+            logger.warning("No node of the energy profile is alive: using the power estimate")
+        return self._best_node_by_power(nodes, role)
+
+    def _best_node_by_energy(self, nodes, role):
+        best_node = {}
+        best_cost = float("inf")
+
+        for node_id, info in nodes.items():
+            _, _, npu_usage, _, _ = self._metrics(node_id, info)
+            devices = ["CPU"]
+            if info["resources"].get("GPU", 0) > 0:
+                devices.append("GPU")
+            # The NPU only accelerates detection, and only one task at a time.
+            if (
+                role == "DETECTION"
+                and info["resources"].get("NPU", 0) > 0
+                and npu_usage == 0
+                and not self.npu_is_pending(node_id)
+            ):
+                devices.append("NPU")
+
+            for device in devices:
+                joules = self.energy_profile.get(f"{info.get('hostname')}:{device}", {}).get(role)
+                if joules is None:
+                    continue
+                cost = joules + self.pending_on_node(node_id)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_node = {"id_node": node_id, "device": device}
+
+        if best_node:
+            self.save_best_score(best_node["id_node"], best_cost, role)
+        return best_node
+
+    def _best_node_by_power(self, nodes, role):
         best_node = {}
         best_score = float("inf")
         npu_selected = False
@@ -466,3 +524,35 @@ class OptimumScheduler(Scheduler):
         if best_node:
             self.save_best_score(best_node["id_node"], best_score, role)
         return best_node
+
+
+class PinnedScheduler(Scheduler):
+    """Always picks the node and device it is told to: for calibration, to measure what a
+    given node/device costs (time, energy) with the placement under control.
+
+    `detection` and `classification` are "hostname:DEVICE", e.g. "wadas1:NPU" or "wadas3:GPU".
+    """
+
+    DEVICES = ("CPU", "GPU", "NPU")
+
+    def __init__(self, detection, classification, **kwargs):
+        super().__init__(**kwargs)
+        self.targets = {
+            "DETECTION": self._parse(detection),
+            "CLASSIFICATION": self._parse(classification),
+        }
+
+    def _parse(self, spec):
+        hostname, _, device = spec.partition(":")
+        if not hostname or device not in self.DEVICES:
+            raise ValueError(
+                f"Expected hostname:DEVICE with DEVICE in {self.DEVICES}, got {spec!r}"
+            )
+        return hostname, device
+
+    def _best_node(self, nodes, role):
+        hostname, device = self.targets[role]
+        for node_id, info in nodes.items():
+            if info.get("hostname") == hostname:
+                return {"id_node": node_id, "device": device}
+        raise ValueError(f"No alive Ray node is named {hostname}")

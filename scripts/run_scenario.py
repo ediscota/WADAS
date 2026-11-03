@@ -36,6 +36,7 @@ from energy import energy_between, measure_idle_watts, read_energy
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TASK_SCRIPT = Path(__file__).resolve().with_name("run_video_task.py")
 USE_CASES = ("MONITORING", "ACTUATOR", "CRITICAL")
+CALIBRATION_USE_CASES = ("PINNED",)  # only when asked for: it needs --scheduler-params
 
 TASK_FIELDS = [
     "run_id",
@@ -80,6 +81,8 @@ SCENARIO_FIELDS = [
     "energy_j",
     "energy_active_j",
     "idle_w",
+    "energy_by_node_j",
+    "idle_by_node_w",
 ]
 
 
@@ -88,7 +91,12 @@ def parse_args(argv=None):
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--videos-dir", type=Path, default=Path.home() / "VIDEO_TEST")
-    parser.add_argument("--use-cases", nargs="+", choices=USE_CASES, default=list(USE_CASES))
+    parser.add_argument(
+        "--use-cases",
+        nargs="+",
+        choices=USE_CASES + CALIBRATION_USE_CASES,
+        default=list(USE_CASES),
+    )
     parser.add_argument(
         "--scheduler-params",
         default="{}",
@@ -291,16 +299,31 @@ def print_energy_summary(scenario_rows):
             f"({mean(r['energy_active_j'] for r in rows):.0f} J above idle), "
             f"{mean(per_task):.1f} J per task above idle"
         )
+        by_node = defaultdict(list)
+        for row in rows:
+            for node, joules in json.loads(row.get("energy_by_node_j") or "{}").items():
+                by_node[node].append(joules)
+        if by_node:
+            print(
+                "  per node (mean J per scenario): "
+                + ", ".join(
+                    f"{node} {mean(values):.0f}" for node, values in sorted(by_node.items())
+                )
+            )
 
 
-def alive_node_ips():
-    """IP addresses of the alive Ray nodes, where the exporters listen."""
+def alive_node_names():
+    """{IP address: hostname} of the alive Ray nodes, where the exporters listen."""
     import ray
 
     ray.init(address="auto", logging_level="ERROR")
-    ips = [node["NodeManagerAddress"] for node in ray.nodes() if node["Alive"]]
+    names = {
+        node["NodeManagerAddress"]: node["NodeManagerHostname"]
+        for node in ray.nodes()
+        if node["Alive"]
+    }
     ray.shutdown()
-    return ips
+    return names
 
 
 def prepare_pending_registry():
@@ -336,13 +359,15 @@ def main(argv=None):
     run_dir.mkdir(parents=True)
     write_metadata(args, run_dir, videos, photos)
 
-    node_ips, idle_w = [], None
+    node_names, node_ips, idle_by_ip, idle_w = {}, [], {}, None
     if args.measure_energy:
-        node_ips = alive_node_ips()
+        node_names = alive_node_names()
+        node_ips = list(node_names)
         print(f"Measuring the idle power of {len(node_ips)} node(s) for {args.idle_seconds:g}s...")
-        idle_w = measure_idle_watts(node_ips, args.idle_seconds)
-        if idle_w is None:
+        idle_by_ip = measure_idle_watts(node_ips, args.idle_seconds)
+        if idle_by_ip is None:
             sys.exit("Cannot read the energy counters of every node: is the power exporter up?")
+        idle_w = sum(idle_by_ip.values())
         print(f"Idle power of the cluster: {idle_w:.1f} W", flush=True)
 
     plan = plan_scenarios(args.use_cases, args.repeats, args.seed)
@@ -366,12 +391,18 @@ def main(argv=None):
             before = read_energy(node_ips) if args.measure_energy else None
             rows, scenario_row = run_scenario(args, tasks, index, repeat, use_case, run_dir)
             if args.measure_energy:
-                _, joules = energy_between(before, read_energy(node_ips))
+                per_node, joules = energy_between(before, read_energy(node_ips))
                 if joules is not None:
                     scenario_row.update(
                         energy_j=joules,
                         energy_active_j=joules - idle_w * scenario_row["makespan_s"],
                         idle_w=idle_w,
+                        energy_by_node_j=json.dumps(
+                            {node_names[ip]: round(j, 1) for ip, j in per_node.items()}
+                        ),
+                        idle_by_node_w=json.dumps(
+                            {node_names[ip]: round(w, 2) for ip, w in idle_by_ip.items()}
+                        ),
                     )
             tasks_csv.writerows(rows)
             scenarios_csv.writerow(scenario_row)

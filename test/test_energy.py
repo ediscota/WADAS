@@ -77,4 +77,4 @@ def test_idle_watts_is_energy_over_time():
         patch.object(energy, "read_energy", side_effect=lambda *a, **k: next(readings)),
         patch.object(energy.time, "sleep"),
     ):
-        assert energy.measure_idle_watts(["a"], seconds=10) == 3.0
+        assert energy.measure_idle_watts(["a"], seconds=10) == {"a": 3.0}

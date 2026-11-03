@@ -31,7 +31,12 @@ from wadas.ai.models import (
     OVMegaDetectorV6YOLO10,
     txt_animalclasses,
 )
-from wadas.ai.schedulers import ActuatorScheduler, MonitoringScheduler, OptimumScheduler
+from wadas.ai.schedulers import (
+    ActuatorScheduler,
+    MonitoringScheduler,
+    OptimumScheduler,
+    PinnedScheduler,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +50,7 @@ USECASE_TO_SCHEDULER = {
     "MONITORING": MonitoringScheduler,
     "ACTUATOR": ActuatorScheduler,
     "CRITICAL": OptimumScheduler,
+    "PINNED": PinnedScheduler,  # calibration only: see PinnedScheduler
 }
 
 
