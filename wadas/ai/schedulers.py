@@ -228,7 +228,11 @@ def load_energy_profile(profile):
     """Return {"host:DEVICE": {"DETECTION": joules, "CLASSIFICATION": joules}}, from a dict or
     from the path of a JSON file, or None."""
     if isinstance(profile, (str, Path)):
-        return json.loads(Path(profile).read_text())
+        path = Path(profile)
+        if not path.is_absolute() and not path.exists():
+            # Relative paths are relative to the repository: tasks change working directory
+            path = Path(__file__).resolve().parents[2] / path
+        return json.loads(path.read_text())
     return profile or None
 
 

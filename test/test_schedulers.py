@@ -370,3 +370,9 @@ def test_the_shipped_energy_profile_is_valid():
     profile = load_energy_profile(path)
     assert profile["wadas1:NPU"]["DETECTION"] < profile["wadas3:GPU"]["DETECTION"]
     assert all(set(costs) <= {"DETECTION", "CLASSIFICATION"} for costs in profile.values())
+
+
+def test_a_relative_profile_path_is_looked_up_in_the_repository(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # a different working directory, as in the experiment tasks
+    profile = load_energy_profile("scripts/energy_profile.json")
+    assert "wadas1:NPU" in profile
