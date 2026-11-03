@@ -31,6 +31,8 @@ from importlib import metadata
 from pathlib import Path
 from statistics import mean, median, stdev
 
+from energy import energy_between, measure_idle_watts, read_energy
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TASK_SCRIPT = Path(__file__).resolve().with_name("run_video_task.py")
 USE_CASES = ("MONITORING", "ACTUATOR", "CRITICAL")
@@ -75,6 +77,9 @@ SCENARIO_FIELDS = [
     "makespan_s",
     "n_ok",
     "n_failed",
+    "energy_j",
+    "energy_active_j",
+    "idle_w",
 ]
 
 
@@ -88,6 +93,17 @@ def parse_args(argv=None):
         "--scheduler-params",
         default="{}",
         help="JSON with scheduler options, e.g. '{\"pending_penalty\": 20}'",
+    )
+    parser.add_argument(
+        "--measure-energy",
+        action="store_true",
+        help="Record the energy used by the cluster in every scenario (needs the power exporter)",
+    )
+    parser.add_argument(
+        "--idle-seconds",
+        type=float,
+        default=30.0,
+        help="Seconds of idle cluster measured first, to subtract the baseline power",
     )
     parser.add_argument("--photos-dir", type=Path, default=Path.home() / "PHOTO_TEST")
     parser.add_argument(
@@ -263,6 +279,30 @@ def print_summary(rows):
             print(f"  {label} placement: {counts}")
 
 
+def print_energy_summary(scenario_rows):
+    by_use_case = defaultdict(list)
+    for row in scenario_rows:
+        if row.get("energy_j") not in (None, ""):
+            by_use_case[row["use_case"]].append(row)
+    for use_case, rows in sorted(by_use_case.items()):
+        per_task = [row["energy_active_j"] / row["n_tasks"] for row in rows]
+        print(
+            f"\n{use_case} energy: scenario mean {mean(r['energy_j'] for r in rows):.0f} J "
+            f"({mean(r['energy_active_j'] for r in rows):.0f} J above idle), "
+            f"{mean(per_task):.1f} J per task above idle"
+        )
+
+
+def alive_node_ips():
+    """IP addresses of the alive Ray nodes, where the exporters listen."""
+    import ray
+
+    ray.init(address="auto", logging_level="ERROR")
+    ips = [node["NodeManagerAddress"] for node in ray.nodes() if node["Alive"]]
+    ray.shutdown()
+    return ips
+
+
 def prepare_pending_registry():
     """Create the shared pending-load registry now: the first call creates it, which takes a
     second or two, and tasks launched together would all wait for it and then read it empty."""
@@ -296,8 +336,18 @@ def main(argv=None):
     run_dir.mkdir(parents=True)
     write_metadata(args, run_dir, videos, photos)
 
+    node_ips, idle_w = [], None
+    if args.measure_energy:
+        node_ips = alive_node_ips()
+        print(f"Measuring the idle power of {len(node_ips)} node(s) for {args.idle_seconds:g}s...")
+        idle_w = measure_idle_watts(node_ips, args.idle_seconds)
+        if idle_w is None:
+            sys.exit("Cannot read the energy counters of every node: is the power exporter up?")
+        print(f"Idle power of the cluster: {idle_w:.1f} W", flush=True)
+
     plan = plan_scenarios(args.use_cases, args.repeats, args.seed)
     all_rows = []
+    scenario_rows = []
     with (
         open(run_dir / "tasks.csv", "w", newline="") as tasks_file,
         open(run_dir / "scenarios.csv", "w", newline="") as scenarios_file,
@@ -313,21 +363,35 @@ def main(argv=None):
                 f"{args.n_videos} video(s) + {args.n_photos} photo(s), {args.stagger:g}s apart",
                 flush=True,
             )
+            before = read_energy(node_ips) if args.measure_energy else None
             rows, scenario_row = run_scenario(args, tasks, index, repeat, use_case, run_dir)
+            if args.measure_energy:
+                _, joules = energy_between(before, read_energy(node_ips))
+                if joules is not None:
+                    scenario_row.update(
+                        energy_j=joules,
+                        energy_active_j=joules - idle_w * scenario_row["makespan_s"],
+                        idle_w=idle_w,
+                    )
             tasks_csv.writerows(rows)
             scenarios_csv.writerow(scenario_row)
             tasks_file.flush()
             scenarios_file.flush()
             all_rows.extend(rows)
+            scenario_rows.append(scenario_row)
+            energy_text = (
+                f", {scenario_row['energy_j']:.0f} J" if "energy_j" in scenario_row else ""
+            )
             print(
                 f"    done in {scenario_row['makespan_s']:.1f}s: "
-                f"{scenario_row['n_ok']} ok, {scenario_row['n_failed']} failed",
+                f"{scenario_row['n_ok']} ok, {scenario_row['n_failed']} failed{energy_text}",
                 flush=True,
             )
             if index < len(plan) - 1:
                 time.sleep(args.cooldown)
 
     print_summary(all_rows)
+    print_energy_summary(scenario_rows)
     print(f"\nResults: {run_dir}")
 
 

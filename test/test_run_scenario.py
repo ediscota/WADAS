@@ -70,3 +70,22 @@ def test_only_photos_does_not_add_a_video():
 
 def test_default_is_one_video():
     assert parse_args([]).n_videos == 1
+
+
+def test_energy_measurement_is_off_by_default():
+    assert not parse_args([]).measure_energy
+    assert parse_args(["--measure-energy", "--idle-seconds", "5"]).idle_seconds == 5
+
+
+def test_energy_summary_reports_energy_per_task(capsys):
+    from run_scenario import print_energy_summary
+
+    rows = [
+        {"use_case": "MONITORING", "n_tasks": 10, "energy_j": 500.0, "energy_active_j": 300.0},
+        {"use_case": "MONITORING", "n_tasks": 10, "energy_j": 700.0, "energy_active_j": 500.0},
+        {"use_case": "CRITICAL", "n_tasks": 10, "energy_j": "", "energy_active_j": ""},
+    ]
+    print_energy_summary(rows)
+    out = capsys.readouterr().out
+    assert "MONITORING energy: scenario mean 600 J (400 J above idle), 40.0 J per task" in out
+    assert "CRITICAL" not in out
