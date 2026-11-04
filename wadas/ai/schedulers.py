@@ -69,6 +69,11 @@ DEFAULT_PENDING_TTL = 10.0
 # in memory for as long as its pipeline runs, much longer than the metrics take to show it.
 DEFAULT_CAPACITY_TTL = 60.0
 
+# Disk throughput (bytes/s) taken as "fully busy" by the "headroom" disk term. It is an
+# assumption of the order of a SATA SSD: no disk capacity is measured on the nodes.
+DEFAULT_DISK_REFERENCE_BPS = 500e6
+DISK_TERMS = ("legacy", "off", "headroom")
+
 
 class Scheduler(ABC):
     """Base class for Ray cluster node schedulers.
@@ -236,6 +241,24 @@ class Scheduler(ABC):
                 if node:
                     reserve(node["id_node"], node["device"], role, self._reservation_ttl())
         return best_detection, best_classification
+
+
+def disk_score(read_speed, write_speed, mode="legacy", reference_bps=DEFAULT_DISK_REFERENCE_BPS):
+    """Disk term added to the network score of the Trade-Off scheduler.
+
+    "legacy" is the original term, write / (read + write), which is 0 when nothing is read and
+    about 1 as soon as any read is seen next to heavier writes: a jump of the whole score for
+    a negligible traffic, and a ratio that says nothing about how busy the disk is.
+    "off" leaves the term out. "headroom" is 1 - busy / reference, between 0 (disk saturated)
+    and 1 (disk idle), continuous like the network headroom.
+    """
+    if mode == "off":
+        return 0.0
+    if mode == "headroom":
+        return max(0.0, 1.0 - (read_speed + write_speed) / reference_bps)
+    if mode == "legacy":
+        return write_speed / (read_speed + write_speed) if read_speed else 0.0
+    raise ValueError(f"disk_term must be one of {DISK_TERMS}, got {mode!r}")
 
 
 def load_energy_profile(profile):
@@ -493,6 +516,19 @@ class OptimumScheduler(Scheduler):
         "network_rx_capacity_bytes_per_second",
     }
 
+    def __init__(
+        self,
+        *args,
+        disk_term="legacy",
+        disk_reference_bps=DEFAULT_DISK_REFERENCE_BPS,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if disk_term not in DISK_TERMS:
+            raise ValueError(f"disk_term must be one of {DISK_TERMS}, got {disk_term!r}")
+        self.disk_term = disk_term
+        self.disk_reference_bps = disk_reference_bps
+
     def _node_metrics(self, node_id, info):
         url = f"http://{info['ip']}:{info['metric_port']}/metrics"
         metrics = self.url_to_metric(url, self.target_metrics)
@@ -520,10 +556,8 @@ class OptimumScheduler(Scheduler):
             npu_usage = npu_metrics.get("npu_utilization", 0)
 
         throughput = self.throughput_score(send_speed, receive_speed, capacity_tx, capacity_rx)
-        performance = (
-            throughput
-            if read_speed == 0
-            else throughput + (write_speed / (read_speed + write_speed))
+        performance = throughput + disk_score(
+            read_speed, write_speed, self.disk_term, self.disk_reference_bps
         )
 
         power = (

@@ -13,6 +13,7 @@ from wadas.ai.schedulers import (
     OptimumScheduler,
     PinnedScheduler,
     Scheduler,
+    disk_score,
     load_energy_profile,
 )
 
@@ -457,3 +458,63 @@ def test_a_capacity_alone_is_enough_to_track_the_placements(cluster):
         MonitoringScheduler(energy_profile=CAPACITY_PROFILE).best_nodes_det_class()
     read_pending.assert_called_once()
     assert reserve.call_count == 2
+
+
+# --- disk term of the Trade-Off scheduler ---
+
+
+def test_the_legacy_disk_term_jumps_with_a_negligible_read():
+    quiet = disk_score(0.0, 5e6, "legacy")
+    tiny_read = disk_score(1.0, 5e6, "legacy")
+    assert quiet == 0.0
+    assert tiny_read == pytest.approx(1.0, abs=1e-6)  # a whole point for one byte per second
+
+
+def test_the_headroom_disk_term_is_continuous():
+    assert disk_score(0.0, 5e6, "headroom") == pytest.approx(
+        disk_score(1.0, 5e6, "headroom"), abs=1e-6
+    )
+
+
+@pytest.mark.parametrize(
+    "read, write, expected",
+    [(0, 0, 1.0), (125e6, 125e6, 0.5), (400e6, 400e6, 0.0), (1e12, 0, 0.0)],
+)
+def test_the_headroom_disk_term_is_a_bounded_headroom(read, write, expected):
+    assert disk_score(read, write, "headroom", reference_bps=500e6) == pytest.approx(expected)
+
+
+def test_a_busier_disk_scores_lower_with_the_headroom_term():
+    assert disk_score(1e6, 1e6, "headroom") > disk_score(100e6, 100e6, "headroom")
+
+
+def test_the_disk_term_can_be_left_out():
+    assert disk_score(3.0, 7.0, "off") == 0.0
+
+
+def test_an_unknown_disk_term_is_refused():
+    with pytest.raises(ValueError, match="disk_term"):
+        disk_score(1.0, 1.0, "bogus")
+    with pytest.raises(ValueError, match="disk_term"):
+        OptimumScheduler(disk_term="bogus")
+
+
+def disk_busy_cluster(cluster, read):
+    cluster["10.0.0.1"] = idle(cpu=5.0, net=1e4)
+    cluster["10.0.0.2"] = idle(cpu=6.0, net=1e4)
+    return [
+        ray_node("a", "10.0.0.1", {"CPU": 6, "GPU": 1}),
+        ray_node("b", "10.0.0.2", {"CPU": 6, "GPU": 1}),
+    ]
+
+
+@pytest.mark.parametrize("disk_term", ["legacy", "off", "headroom"])
+def test_every_disk_term_still_picks_a_node(cluster, disk_term):
+    nodes = disk_busy_cluster(cluster, 0.0)
+    with patch("wadas.ai.schedulers.ray.nodes", return_value=nodes):
+        detection, classification = OptimumScheduler(disk_term=disk_term).best_nodes_det_class()
+    assert detection["id_node"] and classification["id_node"]
+
+
+def test_the_default_disk_term_is_the_legacy_one():
+    assert OptimumScheduler().disk_term == "legacy"

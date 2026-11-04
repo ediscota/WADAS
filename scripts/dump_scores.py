@@ -23,10 +23,12 @@ sys.path.insert(0, str(REPO_ROOT))
 from wadas.ai.schedulers import (  # noqa: E402
     CPU_POWER_WEIGHT,
     DEFAULT_GPU_UTILIZATION,
+    DISK_TERMS,
     GPU_POWER_WEIGHT,
     MEMORY_USAGE_GUARD,
     NPU_POWER_WEIGHT,
     Scheduler,
+    disk_score,
 )
 
 RAY_METRICS = {
@@ -98,7 +100,7 @@ def mean_readings(readings):
     return {field: sum(r[field] for r in readings) / len(readings) for field in RAW_FIELDS}
 
 
-def score_terms(raw):
+def score_terms(raw, disk_term="legacy"):
     """Break the score of the three schedulers into its terms, from the raw metrics."""
     mem_ratio = raw["mem_used"] / raw["mem_total"] if raw["mem_total"] else 0
     throughput = Scheduler.throughput_score(raw["tx"], raw["rx"], raw["cap_tx"], raw["cap_rx"])
@@ -108,10 +110,7 @@ def score_terms(raw):
     power = cpu_term + gpu_term + npu_term
     watt = power + mem_ratio
 
-    disk_total = raw["disk_read"] + raw["disk_write"]
-    performance = (
-        throughput if raw["disk_read"] == 0 else throughput + raw["disk_write"] / disk_total
-    )
+    performance = throughput + disk_score(raw["disk_read"], raw["disk_write"], disk_term)
     return {
         "mem_ratio": mem_ratio,
         "cpu_term": cpu_term,
@@ -143,6 +142,9 @@ def main(argv=None):
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--repeats", type=int, default=1, help="Readings to average")
+    parser.add_argument(
+        "--disk-term", choices=DISK_TERMS, default="legacy", help="Disk term of the Trade-Off score"
+    )
     parser.add_argument("--interval", type=float, default=2.0, help="Seconds between readings")
     args = parser.parse_args(argv)
 
@@ -163,7 +165,7 @@ def main(argv=None):
             time.sleep(args.interval)
 
     raw = {nid: mean_readings(r) for nid, r in readings.items()}
-    terms = {nid: score_terms(r) for nid, r in raw.items()}
+    terms = {nid: score_terms(r, args.disk_term) for nid, r in raw.items()}
     order = sorted(nodes, key=lambda nid: hostnames.get(nid, nid))
     name = lambda nid: hostnames.get(nid, nid[:8])  # noqa: E731
 
