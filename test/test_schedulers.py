@@ -369,10 +369,83 @@ def test_the_shipped_energy_profile_is_valid():
     path = Path(__file__).resolve().parents[1] / "scripts" / "energy_profile.json"
     profile = load_energy_profile(path)
     assert profile["wadas1:NPU"]["DETECTION"] < profile["wadas3:GPU"]["DETECTION"]
-    assert all(set(costs) <= {"DETECTION", "CLASSIFICATION"} for costs in profile.values())
+    costs = {key: value for key, value in profile.items() if key != "capacity"}
+    assert all(set(value) <= {"DETECTION", "CLASSIFICATION"} for value in costs.values())
+    assert all(isinstance(limit, int) and limit > 0 for limit in profile["capacity"].values())
 
 
 def test_a_relative_profile_path_is_looked_up_in_the_repository(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # a different working directory, as in the experiment tasks
     profile = load_energy_profile("scripts/energy_profile.json")
     assert "wadas1:NPU" in profile
+
+
+# --- capacity: how many models a node may be given before it gets no more ---
+
+CAPACITY_PROFILE = {**PROFILE, "capacity": {"wadas1": 3}}
+
+
+def models_on_wadas1(count, age=20.0):
+    return PendingLoad([("id-1", "GPU", "CLASSIFICATION", age)] * count)
+
+
+def test_a_node_at_its_capacity_receives_no_more_work(cluster):
+    # wadas1 is far cheaper (20 J against 100 J), but it already holds 3 models
+    detection, _ = energy_decision(
+        cluster, models_on_wadas1(3), energy_profile=CAPACITY_PROFILE, pending_penalty=1.0
+    )
+    assert detection["id_node"] == "id-3"
+
+
+def test_a_node_below_its_capacity_is_still_used(cluster):
+    detection, _ = energy_decision(
+        cluster, models_on_wadas1(2), energy_profile=CAPACITY_PROFILE, pending_penalty=1.0
+    )
+    assert detection["id_node"] == "id-1"
+
+
+def test_the_capacity_counts_models_for_longer_than_the_penalty_does(cluster):
+    # 3 models placed 20 s ago: too old for the 10 s penalty window, still in memory
+    detection, _ = energy_decision(
+        cluster, models_on_wadas1(3, age=20.0), energy_profile=CAPACITY_PROFILE, pending_penalty=1.0
+    )
+    assert detection["id_node"] == "id-3"
+
+    forgotten = energy_decision(
+        cluster, models_on_wadas1(3, age=90.0), energy_profile=CAPACITY_PROFILE, pending_penalty=1.0
+    )[0]
+    assert forgotten["id_node"] == "id-1"
+
+
+def test_when_every_node_is_full_the_cheapest_is_used_anyway(cluster):
+    full = PendingLoad(
+        [("id-1", "GPU", "CLASSIFICATION", 5.0)] * 3 + [("id-3", "GPU", "DETECTION", 5.0)] * 3
+    )
+    profile = {**PROFILE, "capacity": {"wadas1": 3, "wadas3": 3}}
+    detection, classification = energy_decision(cluster, full, energy_profile=profile)
+    assert detection["id_node"] and classification["id_node"]
+
+
+def test_decisions_are_recorded_for_as_long_as_the_capacity_window(cluster):
+    nodes = profile_cluster(cluster)
+    with (
+        patch("wadas.ai.schedulers.ray.nodes", return_value=nodes),
+        patch("wadas.ai.schedulers.read_pending", return_value=PendingLoad()),
+        patch("wadas.ai.schedulers.reserve") as reserve,
+    ):
+        MonitoringScheduler(
+            energy_profile=CAPACITY_PROFILE, pending_penalty=1.0, pending_ttl=10, capacity_ttl=45
+        ).best_nodes_det_class()
+    assert {call.args[3] for call in reserve.call_args_list} == {45}
+
+
+def test_a_capacity_alone_is_enough_to_track_the_placements(cluster):
+    nodes = profile_cluster(cluster)
+    with (
+        patch("wadas.ai.schedulers.ray.nodes", return_value=nodes),
+        patch("wadas.ai.schedulers.read_pending", return_value=PendingLoad()) as read_pending,
+        patch("wadas.ai.schedulers.reserve") as reserve,
+    ):
+        MonitoringScheduler(energy_profile=CAPACITY_PROFILE).best_nodes_det_class()
+    read_pending.assert_called_once()
+    assert reserve.call_count == 2

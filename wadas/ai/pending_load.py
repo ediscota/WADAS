@@ -19,20 +19,21 @@
 
 import logging
 import time
-from collections import Counter
 
 import ray
 
 logger = logging.getLogger(__name__)
 
-REGISTRY_NAME = "wadas_pending_load"
+# The name changes with the record format, so that an actor left running by an older version
+# of the code is never mistaken for this one.
+REGISTRY_NAME = "wadas_pending_load_v2"
 REGISTRY_NAMESPACE = "wadas"
 REGISTRY_TIMEOUT = 5.0  # seconds to wait for the registry before ignoring it
 
 
 class PendingRegistry:
-    """Decisions taken in the last few seconds. Runs as a detached Ray actor, so that every
-    process taking placement decisions (one per camera) sees the same record."""
+    """Recent placement decisions. Runs as a detached Ray actor, so that every process taking
+    placement decisions (one per camera) sees the same record."""
 
     def __init__(self, clock=time.time):
         self._clock = clock
@@ -40,27 +41,44 @@ class PendingRegistry:
 
     def add(self, node_id, device, role, ttl):
         """Record that a model for `role` was just placed on `device` of `node_id`."""
-        self._entries.append((node_id, device, role, self._clock() + ttl))
+        now = self._clock()
+        self._entries.append((node_id, device, role, now, now + ttl))
 
     def snapshot(self):
-        """Return [(node_id, device, role)] of the decisions that have not expired yet."""
+        """Return [(node_id, device, role, age_seconds)] of the decisions not expired yet."""
         now = self._clock()
-        self._entries = [entry for entry in self._entries if entry[3] > now]
-        return [entry[:3] for entry in self._entries]
+        self._entries = [entry for entry in self._entries if entry[4] > now]
+        return [
+            (node, device, role, now - created) for node, device, role, created, _ in self._entries
+        ]
 
 
 class PendingLoad:
-    """Counts of recent decisions per node and per node device."""
+    """Recent placement decisions, counted per node and per node device.
+
+    Entries are (node_id, device, role, age_seconds); the age may be left out, which counts
+    the entry as brand new. The counts take `max_age` (seconds), to look only at the most
+    recent decisions: a model keeps using memory long after its load shows in the metrics.
+    """
 
     def __init__(self, entries=()):
-        self._per_node = Counter(node_id for node_id, _, _ in entries)
-        self._per_device = Counter((node_id, device) for node_id, device, _ in entries)
+        self._entries = [
+            (entry[0], entry[1], entry[3] if len(entry) > 3 else 0.0) for entry in entries
+        ]
 
-    def on_node(self, node_id):
-        return self._per_node[node_id]
+    def on_node(self, node_id, max_age=None):
+        return sum(1 for node, _, age in self._entries if node == node_id and _recent(age, max_age))
 
-    def on_device(self, node_id, device):
-        return self._per_device[(node_id, device)]
+    def on_device(self, node_id, device, max_age=None):
+        return sum(
+            1
+            for node, dev, age in self._entries
+            if node == node_id and dev == device and _recent(age, max_age)
+        )
+
+
+def _recent(age, max_age):
+    return max_age is None or age <= max_age
 
 
 def _registry():

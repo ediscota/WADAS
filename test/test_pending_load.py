@@ -18,7 +18,17 @@ def test_registry_returns_what_was_added():
     registry = PendingRegistry(clock=Clock())
     registry.add("n1", "GPU", "DETECTION", ttl=10)
     registry.add("n2", "NPU", "DETECTION", ttl=10)
-    assert registry.snapshot() == [("n1", "GPU", "DETECTION"), ("n2", "NPU", "DETECTION")]
+    assert registry.snapshot() == [("n1", "GPU", "DETECTION", 0), ("n2", "NPU", "DETECTION", 0)]
+
+
+def test_the_snapshot_reports_how_old_each_decision_is():
+    clock = Clock()
+    registry = PendingRegistry(clock=clock)
+    registry.add("n1", "GPU", "DETECTION", ttl=60)
+    clock.now += 7
+    registry.add("n2", "GPU", "DETECTION", ttl=60)
+    clock.now += 3
+    assert registry.snapshot() == [("n1", "GPU", "DETECTION", 10), ("n2", "GPU", "DETECTION", 3)]
 
 
 def test_entries_expire_after_their_ttl():
@@ -27,7 +37,7 @@ def test_entries_expire_after_their_ttl():
     registry.add("n1", "GPU", "DETECTION", ttl=10)
     registry.add("n2", "GPU", "DETECTION", ttl=30)
     clock.now += 11
-    assert registry.snapshot() == [("n2", "GPU", "DETECTION")]
+    assert registry.snapshot() == [("n2", "GPU", "DETECTION", 11)]
     clock.now += 20
     assert registry.snapshot() == []
 
@@ -40,6 +50,21 @@ def test_pending_load_counts_per_node_and_device():
     assert load.on_node("n3") == 0
     assert load.on_device("n1", "NPU") == 1
     assert load.on_device("n2", "NPU") == 0
+
+
+def test_the_counts_can_look_only_at_recent_decisions():
+    load = PendingLoad(
+        [
+            ("n1", "NPU", "DETECTION", 2.0),
+            ("n1", "GPU", "CLASSIFICATION", 25.0),
+            ("n2", "GPU", "DETECTION", 9.0),
+        ]
+    )
+    assert load.on_node("n1") == 2
+    assert load.on_node("n1", max_age=10) == 1
+    assert load.on_node("n1", max_age=60) == 2
+    assert load.on_device("n1", "GPU", max_age=10) == 0
+    assert load.on_device("n1", "GPU", max_age=30) == 1
 
 
 def test_an_unreachable_registry_is_ignored():

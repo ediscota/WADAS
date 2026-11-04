@@ -65,6 +65,10 @@ GPU_UTILIZATION_GUARD = 75.0
 # creates only show up in the node metrics a few seconds after the decision.
 DEFAULT_PENDING_TTL = 10.0
 
+# How long a placement keeps counting against the capacity of a node (seconds). A model stays
+# in memory for as long as its pipeline runs, much longer than the metrics take to show it.
+DEFAULT_CAPACITY_TTL = 60.0
+
 
 class Scheduler(ABC):
     """Base class for Ray cluster node schedulers.
@@ -85,11 +89,13 @@ class Scheduler(ABC):
         scores_path: str | Path | None = None,
         pending_penalty: float = 0.0,
         pending_ttl: float = DEFAULT_PENDING_TTL,
+        capacity_ttl: float = DEFAULT_CAPACITY_TTL,
     ):
         self.save_scores = save_scores
         self.scores_path = Path(scores_path) if scores_path else None
         self.pending_penalty = pending_penalty
         self.pending_ttl = pending_ttl
+        self.capacity_ttl = capacity_ttl
         self._pending = PendingLoad()
         self._metrics_cache = {}
 
@@ -191,11 +197,19 @@ class Scheduler(ABC):
 
     def pending_on_node(self, node_id):
         """Placements decided recently on this node, weighted by `pending_penalty`."""
-        return self.pending_penalty * self._pending.on_node(node_id)
+        return self.pending_penalty * self._pending.on_node(node_id, max_age=self.pending_ttl)
 
     def npu_is_pending(self, node_id):
         """Whether a model was just assigned to the NPU of this node."""
-        return self._pending.on_device(node_id, "NPU") > 0
+        return self._pending.on_device(node_id, "NPU", max_age=self.pending_ttl) > 0
+
+    def _uses_pending(self):
+        """Whether the decisions read and record the pending load."""
+        return self.pending_penalty > 0
+
+    def _reservation_ttl(self):
+        """How long a decision stays in the record."""
+        return self.pending_ttl
 
     @abstractmethod
     def _best_node(self, nodes, role):
@@ -205,7 +219,7 @@ class Scheduler(ABC):
         """Return (best_detection_node, best_classification_node), each a dict as above."""
         nodes = self.find_nodes()
         self._metrics_cache = {}
-        if self.pending_penalty > 0:
+        if self._uses_pending():
             # Reading the metrics takes a few hundred ms. The pending load is read only after
             # it, and the decision is recorded right after taking it: requests arriving
             # together would otherwise all read the same empty record.
@@ -214,13 +228,13 @@ class Scheduler(ABC):
             self._pending = read_pending()
         best_detection = self._best_node(nodes, "DETECTION")
         best_classification = self._best_node(nodes, "CLASSIFICATION")
-        if self.pending_penalty > 0:
+        if self._uses_pending():
             for node, role in (
                 (best_detection, "DETECTION"),
                 (best_classification, "CLASSIFICATION"),
             ):
                 if node:
-                    reserve(node["id_node"], node["device"], role, self.pending_ttl)
+                    reserve(node["id_node"], node["device"], role, self._reservation_ttl())
         return best_detection, best_classification
 
 
@@ -244,11 +258,32 @@ class MonitoringScheduler(Scheduler):
     scripts/energy_profile.json) it picks the node/device where the task costs the least
     energy, instead of estimating power from the device loads. Use it with `pending_penalty`
     (here in joules): the cheapest device alone would receive every request of a burst.
+
+    The profile may also hold a "capacity": {hostname: n}, the number of models a node can
+    keep in memory. A node with that many placements in the last `capacity_ttl` seconds
+    receives no more (unless no node is left), so the penalty can stay low without
+    overloading the nodes with little memory.
     """
 
     def __init__(self, *args, energy_profile=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.energy_profile = load_energy_profile(energy_profile)
+        self.capacity = (self.energy_profile or {}).get("capacity", {})
+
+    def _uses_pending(self):
+        return super()._uses_pending() or bool(self.capacity)
+
+    def _reservation_ttl(self):
+        # The capacity counts placements for longer than the penalty does
+        if self.capacity:
+            return max(self.pending_ttl, self.capacity_ttl)
+        return super()._reservation_ttl()
+
+    def _at_capacity(self, node_id, info):
+        limit = self.capacity.get(info.get("hostname"))
+        if limit is None:
+            return False
+        return self._pending.on_node(node_id, max_age=self.capacity_ttl) >= limit
 
     target_metrics = {
         "ray_node_cpu_utilization",
@@ -280,14 +315,19 @@ class MonitoringScheduler(Scheduler):
         if self.energy_profile:
             if best_node := self._best_node_by_energy(nodes, role):
                 return best_node
+            # Every node is full: better an overloaded node than none
+            if best_node := self._best_node_by_energy(nodes, role, respect_capacity=False):
+                return best_node
             logger.warning("No node of the energy profile is alive: using the power estimate")
         return self._best_node_by_power(nodes, role)
 
-    def _best_node_by_energy(self, nodes, role):
+    def _best_node_by_energy(self, nodes, role, respect_capacity=True):
         best_node = {}
         best_cost = float("inf")
 
         for node_id, info in nodes.items():
+            if respect_capacity and self._at_capacity(node_id, info):
+                continue
             _, _, npu_usage, _, _ = self._metrics(node_id, info)
             devices = ["CPU"]
             if info["resources"].get("GPU", 0) > 0:

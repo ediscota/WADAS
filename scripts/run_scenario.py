@@ -341,7 +341,8 @@ def prepare_pending_registry():
 
 def main(argv=None):
     args = parse_args(argv)
-    if json.loads(args.scheduler_params).get("pending_penalty", 0) > 0:
+    params = json.loads(args.scheduler_params)
+    if params.get("pending_penalty", 0) > 0 or params.get("energy_profile"):
         prepare_pending_registry()
     videos = sorted(args.videos_dir.expanduser().glob("*.mp4"))
     if args.n_videos and not videos:
