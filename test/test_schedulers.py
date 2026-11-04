@@ -371,7 +371,10 @@ def test_the_shipped_energy_profile_is_valid():
     assert profile["wadas1:NPU"]["DETECTION"] < profile["wadas3:GPU"]["DETECTION"]
     costs = {key: value for key, value in profile.items() if key != "capacity"}
     assert all(set(value) <= {"DETECTION", "CLASSIFICATION"} for value in costs.values())
-    assert all(isinstance(limit, int) and limit > 0 for limit in profile["capacity"].values())
+    # The capacity is optional: it made the measured mix worse when set to 12 / 10 models
+    assert all(
+        isinstance(limit, int) and limit > 0 for limit in profile.get("capacity", {}).values()
+    )
 
 
 def test_a_relative_profile_path_is_looked_up_in_the_repository(tmp_path, monkeypatch):
