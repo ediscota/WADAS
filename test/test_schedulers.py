@@ -365,8 +365,13 @@ def test_the_energy_profile_can_be_loaded_from_a_json_file(cluster, tmp_path):
     assert detection == {"id_node": "id-1", "device": "NPU"}
 
 
-def test_the_shipped_energy_profile_is_valid():
-    path = Path(__file__).resolve().parents[1] / "scripts" / "energy_profile.json"
+SHIPPED_PROFILES = sorted(
+    (Path(__file__).resolve().parents[1] / "scripts").glob("energy_profile*.json")
+)
+
+
+@pytest.mark.parametrize("path", SHIPPED_PROFILES, ids=lambda path: path.name)
+def test_the_shipped_energy_profile_is_valid(path):
     profile = load_energy_profile(path)
     assert profile["wadas1:NPU"]["DETECTION"] < profile["wadas3:GPU"]["DETECTION"]
     costs = {key: value for key, value in profile.items() if key != "capacity"}
