@@ -48,6 +48,8 @@ TASK_FIELDS = [
     "task_id",
     "kind",
     "scheduler_params",
+    "detection_model",
+    "classification_model",
     "video",
     "status",
     "error",
@@ -101,6 +103,14 @@ def parse_args(argv=None):
         "--scheduler-params",
         default="{}",
         help="JSON with scheduler options, e.g. '{\"pending_penalty\": 20}'",
+    )
+    parser.add_argument(
+        "--detection-model",
+        help="Detection model version, e.g. MDV6-yolov10n (default: the WADAS default)",
+    )
+    parser.add_argument(
+        "--classification-model",
+        help="Classification model version, e.g. DFv1.4 (default: the WADAS default)",
     )
     parser.add_argument(
         "--measure-energy",
@@ -200,6 +210,12 @@ def launch_task(args, kind, media, use_case, index, task_dir):
         use_case,
         "--scheduler-params",
         args.scheduler_params,
+        *(["--detection-model", args.detection_model] if args.detection_model else []),
+        *(
+            ["--classification-model", args.classification_model]
+            if args.classification_model
+            else []
+        ),
         "--task-id",
         str(index),
         "--out-dir",

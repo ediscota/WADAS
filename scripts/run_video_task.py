@@ -34,6 +34,14 @@ def parse_args(argv=None):
         default="{}",
         help="JSON with scheduler options, e.g. '{\"pending_penalty\": 20}'",
     )
+    parser.add_argument(
+        "--detection-model",
+        help="Detection model version, e.g. MDV6-yolov10n (default: the WADAS default)",
+    )
+    parser.add_argument(
+        "--classification-model",
+        help="Classification model version, e.g. DFv1.4 (default: the WADAS default)",
+    )
     parser.add_argument("--out-dir", required=True, help="Task working dir; result.json goes here")
     parser.add_argument("--task-id", default="0")
     parser.add_argument("--fps", type=int, default=1, help="Video frames sampled per second")
@@ -67,6 +75,10 @@ def run_task(args, video, row):
         AiModel.distributed_inference = True
         AiModel.use_case = args.use_case
         AiModel.scheduler_params = json.loads(args.scheduler_params)
+        if args.detection_model:
+            AiModel.detection_model_version = args.detection_model
+        if args.classification_model:
+            AiModel.classification_model_version = args.classification_model
         AiModel.video_fps = args.fps
 
         started_at = time.time()
@@ -151,6 +163,8 @@ def main(argv=None):
         "use_case": args.use_case,
         "kind": args.kind,
         "scheduler_params": args.scheduler_params,
+        "detection_model": args.detection_model or "default",
+        "classification_model": args.classification_model or "default",
         "video": video.name,
         "status": "error",
     }

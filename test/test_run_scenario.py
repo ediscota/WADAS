@@ -112,3 +112,10 @@ def test_energy_summary_reports_the_mean_per_node(capsys):
     ]
     print_energy_summary(rows)
     assert "per node (mean J per scenario): wadas1 200, wadas3 200" in capsys.readouterr().out
+
+
+def test_model_versions_are_optional():
+    args = parse_args([])
+    assert args.detection_model is None and args.classification_model is None
+    args = parse_args(["--detection-model", "MDV6-yolov10n", "--classification-model", "DFv1.4"])
+    assert (args.detection_model, args.classification_model) == ("MDV6-yolov10n", "DFv1.4")
