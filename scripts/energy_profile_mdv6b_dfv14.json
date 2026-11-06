@@ -5,5 +5,14 @@
   "wadas2:GPU": {"DETECTION": 24.3, "CLASSIFICATION": 18.6},
   "wadas3:GPU": {"DETECTION": 36.3, "CLASSIFICATION": 46.9},
   "wadas4:GPU": {"DETECTION": 39.2, "CLASSIFICATION": 57.9},
-  "wadas5:GPU": {"DETECTION": 37.8, "CLASSIFICATION": 51.5}
+  "wadas5:GPU": {"DETECTION": 37.8, "CLASSIFICATION": 51.5},
+  "latency": {
+    "wadas1:NPU": {"DETECTION": 4.6},
+    "wadas1:GPU": {"DETECTION": 8.1, "CLASSIFICATION": 1.7},
+    "wadas2:NPU": {"DETECTION": 4.6},
+    "wadas2:GPU": {"DETECTION": 8.1, "CLASSIFICATION": 1.7},
+    "wadas3:GPU": {"DETECTION": 4.18, "CLASSIFICATION": 1.1},
+    "wadas4:GPU": {"DETECTION": 4.14, "CLASSIFICATION": 1.1},
+    "wadas5:GPU": {"DETECTION": 4.37, "CLASSIFICATION": 1.1}
+  }
 }

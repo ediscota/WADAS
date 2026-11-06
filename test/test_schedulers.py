@@ -15,6 +15,7 @@ from wadas.ai.schedulers import (
     Scheduler,
     disk_score,
     load_energy_profile,
+    load_latency_profile,
 )
 
 ALL_SCHEDULERS = [MonitoringScheduler, ActuatorScheduler, OptimumScheduler]
@@ -375,7 +376,7 @@ SHIPPED_PROFILES = sorted(
 def test_the_shipped_energy_profile_is_valid(path):
     profile = load_energy_profile(path)
     assert profile["wadas1:NPU"]["DETECTION"] < profile["wadas3:GPU"]["DETECTION"]
-    costs = {key: value for key, value in profile.items() if key != "capacity"}
+    costs = {key: value for key, value in profile.items() if key not in ("capacity", "latency")}
     assert all(set(value) <= {"DETECTION", "CLASSIFICATION"} for value in costs.values())
     # The capacity is optional: it made the measured mix worse when set to 12 / 10 models
     assert all(
@@ -518,3 +519,99 @@ def test_every_disk_term_still_picks_a_node(cluster, disk_term):
 
 def test_the_default_disk_term_is_the_legacy_one():
     assert OptimumScheduler().disk_term == "legacy"
+
+
+# --- latency profile: pick the node/device where the task is expected to finish first ---
+
+LATENCY = {
+    "wadas1:NPU": {"DETECTION": 4.6},
+    "wadas1:GPU": {"DETECTION": 8.0, "CLASSIFICATION": 2.0},
+    "wadas3:GPU": {"DETECTION": 4.0, "CLASSIFICATION": 1.0},
+}
+
+
+def latency_decision(cluster, scheduler_cls=ActuatorScheduler, pending=None, **kwargs):
+    nodes = profile_cluster(cluster)
+    with (
+        patch("wadas.ai.schedulers.ray.nodes", return_value=nodes),
+        patch("wadas.ai.schedulers.read_pending", return_value=pending or PendingLoad()),
+        patch("wadas.ai.schedulers.reserve"),
+    ):
+        return scheduler_cls(**kwargs).best_nodes_det_class()
+
+
+def test_actuator_with_a_latency_profile_picks_the_fastest_device(cluster):
+    detection, classification = latency_decision(cluster, latency_profile=LATENCY)
+    # The faster GPU of wadas3 beats the NPU (4.0 s against 4.6 s), contrary to the fixed order
+    assert detection == {"id_node": "id-3", "device": "GPU"}
+    assert classification == {"id_node": "id-3", "device": "GPU"}
+
+
+def test_actuator_without_a_latency_profile_keeps_the_fixed_device_order(cluster):
+    nodes = profile_cluster(cluster)
+    cluster["10.0.0.3"] = idle(net=9e5)  # the busier link loses the network score
+    with patch("wadas.ai.schedulers.ray.nodes", return_value=nodes):
+        detection, _ = ActuatorScheduler().best_nodes_det_class()
+    assert detection == {"id_node": "id-1", "device": "GPU"}
+
+
+def test_actuator_latency_still_respects_the_memory_guard(cluster):
+    nodes = profile_cluster(cluster)
+    cluster["10.0.0.3"] = idle(mem=80.0)
+    with patch("wadas.ai.schedulers.ray.nodes", return_value=nodes):
+        detection, _ = ActuatorScheduler(latency_profile=LATENCY).best_nodes_det_class()
+    assert detection["id_node"] == "id-1"
+
+
+def test_actuator_latency_pending_placements_cost_seconds(cluster):
+    pending = PendingLoad([("id-3", "GPU", "DETECTION")] * 2)
+    detection, _ = latency_decision(
+        cluster, pending=pending, latency_profile=LATENCY, pending_penalty=0.2
+    )
+    assert detection["id_node"] == "id-3"  # 4.0 + 0.4 s still beats the NPU's 4.6 s
+    detection, _ = latency_decision(
+        cluster, pending=pending, latency_profile=LATENCY, pending_penalty=0.5
+    )
+    assert detection == {"id_node": "id-1", "device": "NPU"}  # 4.0 + 1.0 s loses
+
+
+def test_actuator_latency_with_an_unusable_profile_falls_back_to_the_network_score(cluster):
+    detection, _ = latency_decision(cluster, latency_profile={"nowhere:GPU": {"DETECTION": 1.0}})
+    assert detection["id_node"] in ("id-1", "id-3")
+
+
+def test_the_latency_profile_can_share_the_file_of_the_energy_profile(tmp_path):
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps({**PROFILE, "latency": LATENCY}))
+    assert load_latency_profile(path) == LATENCY
+    assert load_latency_profile(LATENCY) == LATENCY
+
+
+def test_the_energy_profile_ignores_the_latency_section(cluster):
+    detection, _ = energy_decision(cluster, energy_profile={**PROFILE, "latency": LATENCY})
+    assert detection == {"id_node": "id-1", "device": "NPU"}
+
+
+def test_optimum_with_both_profiles_minimizes_energy_times_time(cluster):
+    detection, classification = latency_decision(
+        cluster, OptimumScheduler, energy_profile=PROFILE, latency_profile=LATENCY
+    )
+    # NPU: 20 J x 4.6 s = 92; GPU of wadas3: 100 J x 4.0 s = 400
+    assert detection == {"id_node": "id-1", "device": "NPU"}
+    # wadas1 GPU: 30 x 2.0 = 60; wadas3 GPU: 50 x 1.0 = 50
+    assert classification == {"id_node": "id-3", "device": "GPU"}
+
+
+def test_optimum_needs_both_profiles_or_none():
+    with pytest.raises(ValueError):
+        OptimumScheduler(energy_profile=PROFILE)
+    with pytest.raises(ValueError):
+        OptimumScheduler(latency_profile=LATENCY)
+
+
+def test_optimum_without_profiles_is_unchanged(cluster):
+    cluster.update({"10.0.0.1": idle(), "10.0.0.3": idle()})
+    nodes = profile_cluster(cluster)
+    with patch("wadas.ai.schedulers.ray.nodes", return_value=nodes):
+        detection, _ = OptimumScheduler().best_nodes_det_class()
+    assert detection["id_node"] in ("id-1", "id-3")

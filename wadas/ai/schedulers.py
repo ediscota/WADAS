@@ -273,6 +273,32 @@ def load_energy_profile(profile):
     return profile or None
 
 
+def load_latency_profile(profile):
+    """Return {"host:DEVICE": {"DETECTION": seconds, "CLASSIFICATION": seconds}}, from a dict
+    or from the path of a JSON file, or None. A profile file that also holds the energy
+    profile keeps the latencies in its "latency" section, which is what is returned."""
+    loaded = load_energy_profile(profile)
+    if loaded and "latency" in loaded:
+        return loaded["latency"]
+    return loaded
+
+
+def candidate_devices(scheduler, node_id, info, role, npu_usage):
+    """Devices a task of `role` may run on in this node: the NPU only accelerates detection,
+    and only one task at a time."""
+    devices = ["CPU"]
+    if info["resources"].get("GPU", 0) > 0:
+        devices.append("GPU")
+    if (
+        role == "DETECTION"
+        and info["resources"].get("NPU", 0) > 0
+        and npu_usage == 0
+        and not scheduler.npu_is_pending(node_id)
+    ):
+        devices.append("NPU")
+    return devices
+
+
 class MonitoringScheduler(Scheduler):
     """Picks nodes minimizing estimated power consumption, favoring NPU/CPU
     over GPU: suited for continuous, low-power monitoring workloads.
@@ -352,19 +378,7 @@ class MonitoringScheduler(Scheduler):
             if respect_capacity and self._at_capacity(node_id, info):
                 continue
             _, _, npu_usage, _, _ = self._metrics(node_id, info)
-            devices = ["CPU"]
-            if info["resources"].get("GPU", 0) > 0:
-                devices.append("GPU")
-            # The NPU only accelerates detection, and only one task at a time.
-            if (
-                role == "DETECTION"
-                and info["resources"].get("NPU", 0) > 0
-                and npu_usage == 0
-                and not self.npu_is_pending(node_id)
-            ):
-                devices.append("NPU")
-
-            for device in devices:
+            for device in candidate_devices(self, node_id, info, role, npu_usage):
                 joules = self.energy_profile.get(f"{info.get('hostname')}:{device}", {}).get(role)
                 if joules is None:
                     continue
@@ -422,7 +436,18 @@ class MonitoringScheduler(Scheduler):
 class ActuatorScheduler(Scheduler):
     """Picks nodes maximizing available network throughput, guarded by a
     memory-usage ceiling: suited for actuation workloads that must stream
-    results with low latency."""
+    results with low latency.
+
+    With `latency_profile` (the measured completion time of one task on each node and
+    device, see scripts/energy_profile_mdv6b_dfv14.json) it picks instead the node/device
+    where the task is expected to finish first, which is what low latency means; the
+    memory ceiling still applies. Use it with `pending_penalty` (here in seconds, the
+    expected delay each recent placement causes on its node). Without a profile the
+    behaviour is the original one."""
+
+    def __init__(self, *args, latency_profile=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.latency_profile = load_latency_profile(latency_profile)
 
     target_metrics = {
         "ray_node_disk_io_write_speed",
@@ -467,6 +492,36 @@ class ActuatorScheduler(Scheduler):
         return throughput, gpu_usage, npu_usage, mem_ratio
 
     def _best_node(self, nodes, role):
+        if self.latency_profile:
+            if best_node := self._best_node_by_latency(nodes, role):
+                return best_node
+            logger.warning("No node of the latency profile is usable: using the network score")
+        return self._best_node_by_network(nodes, role)
+
+    def _best_node_by_latency(self, nodes, role):
+        best_node = {}
+        best_cost = float("inf")
+
+        for node_id, info in nodes.items():
+            _, _, npu_usage, mem_ratio = self._metrics(node_id, info)
+            if mem_ratio >= MEMORY_USAGE_GUARD:
+                continue
+            for device in candidate_devices(self, node_id, info, role, npu_usage):
+                seconds = self.latency_profile.get(f"{info.get('hostname')}:{device}", {}).get(
+                    role
+                )
+                if seconds is None:
+                    continue
+                cost = seconds + self.pending_on_node(node_id)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_node = {"id_node": node_id, "device": device}
+
+        if best_node:
+            self.save_best_score(best_node["id_node"], best_cost, role)
+        return best_node
+
+    def _best_node_by_network(self, nodes, role):
         best_node = {}
         # Pending placements can push the score below zero, which must not rule a node out.
         best_score = float("-inf")
@@ -521,6 +576,8 @@ class OptimumScheduler(Scheduler):
         *args,
         disk_term="legacy",
         disk_reference_bps=DEFAULT_DISK_REFERENCE_BPS,
+        energy_profile=None,
+        latency_profile=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -528,6 +585,10 @@ class OptimumScheduler(Scheduler):
             raise ValueError(f"disk_term must be one of {DISK_TERMS}, got {disk_term!r}")
         self.disk_term = disk_term
         self.disk_reference_bps = disk_reference_bps
+        self.energy_profile = load_energy_profile(energy_profile)
+        self.latency_profile = load_latency_profile(latency_profile)
+        if bool(self.energy_profile) != bool(self.latency_profile):
+            raise ValueError("energy_profile and latency_profile must be given together")
 
     def _node_metrics(self, node_id, info):
         url = f"http://{info['ip']}:{info['metric_port']}/metrics"
@@ -570,6 +631,36 @@ class OptimumScheduler(Scheduler):
         return performance, watt, cpu_usage, gpu_usage, npu_usage
 
     def _best_node(self, nodes, role):
+        if self.energy_profile and self.latency_profile:
+            if best_node := self._best_node_by_energy_delay(nodes, role):
+                return best_node
+            logger.warning("No node of the profiles is usable: using the performance/watt score")
+        return self._best_node_by_ratio(nodes, role)
+
+    def _best_node_by_energy_delay(self, nodes, role):
+        """Minimize energy x time, the classic trade-off between the two: `pending_penalty`
+        is in seconds, added to the expected time of the node."""
+        best_node = {}
+        best_cost = float("inf")
+
+        for node_id, info in nodes.items():
+            _, _, cpu_usage, gpu_usage, npu_usage = self._metrics(node_id, info)
+            for device in candidate_devices(self, node_id, info, role, npu_usage):
+                key = f"{info.get('hostname')}:{device}"
+                joules = self.energy_profile.get(key, {}).get(role)
+                seconds = self.latency_profile.get(key, {}).get(role)
+                if joules is None or seconds is None:
+                    continue
+                cost = joules * (seconds + self.pending_on_node(node_id))
+                if cost < best_cost:
+                    best_cost = cost
+                    best_node = {"id_node": node_id, "device": device}
+
+        if best_node:
+            self.save_best_score(best_node["id_node"], best_cost, role)
+        return best_node
+
+    def _best_node_by_ratio(self, nodes, role):
         best_node = {}
         best_score = 0.0
 
