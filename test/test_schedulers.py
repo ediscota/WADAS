@@ -547,11 +547,24 @@ def test_actuator_with_a_latency_profile_picks_the_fastest_device(cluster):
     assert classification == {"id_node": "id-3", "device": "GPU"}
 
 
-def test_actuator_without_a_latency_profile_keeps_the_fixed_device_order(cluster):
+@pytest.mark.parametrize(
+    "kwargs, device", [({}, "GPU"), ({"npu_first": True}, "NPU"), ({"npu_first": False}, "GPU")]
+)
+def test_actuator_without_a_latency_profile_uses_a_fixed_device_order(cluster, kwargs, device):
     nodes = profile_cluster(cluster)
     cluster["10.0.0.3"] = idle(net=9e5)  # the busier link loses the network score
     with patch("wadas.ai.schedulers.ray.nodes", return_value=nodes):
-        detection, _ = ActuatorScheduler().best_nodes_det_class()
+        detection, classification = ActuatorScheduler(**kwargs).best_nodes_det_class()
+    assert detection == {"id_node": "id-1", "device": device}
+    assert classification == {"id_node": "id-1", "device": "GPU"}  # the NPU is detection only
+
+
+def test_actuator_with_npu_first_falls_back_to_the_gpu_when_the_npu_is_busy(cluster):
+    nodes = profile_cluster(cluster)
+    cluster["10.0.0.1"] = idle(npu=40.0)
+    cluster["10.0.0.3"] = idle(net=9e5)
+    with patch("wadas.ai.schedulers.ray.nodes", return_value=nodes):
+        detection, _ = ActuatorScheduler(npu_first=True).best_nodes_det_class()
     assert detection == {"id_node": "id-1", "device": "GPU"}
 
 
@@ -602,9 +615,21 @@ def test_optimum_with_both_profiles_minimizes_energy_times_time(cluster):
     assert classification == {"id_node": "id-3", "device": "GPU"}
 
 
-def test_optimum_needs_both_profiles_or_none():
-    with pytest.raises(ValueError):
-        OptimumScheduler(energy_profile=PROFILE)
+def test_optimum_with_the_energy_profile_alone_minimizes_the_energy(cluster):
+    detection, classification = latency_decision(cluster, OptimumScheduler, energy_profile=PROFILE)
+    assert detection == {"id_node": "id-1", "device": "NPU"}
+    assert classification == {"id_node": "id-1", "device": "GPU"}  # 30 J against 50 J
+
+
+def test_optimum_energy_alone_counts_pending_placements_in_joules(cluster):
+    pending = PendingLoad([("id-1", "GPU", "CLASSIFICATION")] * 2)
+    _, classification = latency_decision(
+        cluster, OptimumScheduler, pending=pending, energy_profile=PROFILE, pending_penalty=15.0
+    )
+    assert classification == {"id_node": "id-3", "device": "GPU"}  # 30 + 30 J loses to 50 J
+
+
+def test_optimum_refuses_a_latency_profile_without_the_energy_profile():
     with pytest.raises(ValueError):
         OptimumScheduler(latency_profile=LATENCY)
 

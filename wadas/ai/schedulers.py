@@ -443,11 +443,17 @@ class ActuatorScheduler(Scheduler):
     where the task is expected to finish first, which is what low latency means; the
     memory ceiling still applies. Use it with `pending_penalty` (here in seconds, the
     expected delay each recent placement causes on its node). Without a profile the
-    behaviour is the original one."""
+    behaviour is the original one.
 
-    def __init__(self, *args, latency_profile=None, **kwargs):
+    Without a profile the device is chosen by a fixed order: the GPU if it is not saturated,
+    then the free NPU for detection, then the CPU. `npu_first=True` puts the free NPU before
+    the GPU for detection, as the other schedulers do: measured on the cluster it made no
+    significant difference, so the original order stays the default."""
+
+    def __init__(self, *args, latency_profile=None, npu_first=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.latency_profile = load_latency_profile(latency_profile)
+        self.npu_first = npu_first
 
     target_metrics = {
         "ray_node_disk_io_write_speed",
@@ -538,7 +544,9 @@ class ActuatorScheduler(Scheduler):
                     and npu_usage == 0
                     and not self.npu_is_pending(node_id)
                 )
-                if gpu_usage < GPU_UTILIZATION_GUARD and info["resources"].get("GPU", 0) > 0:
+                if self.npu_first and npu_free:
+                    best_node = {"id_node": node_id, "device": "NPU"}
+                elif gpu_usage < GPU_UTILIZATION_GUARD and info["resources"].get("GPU", 0) > 0:
                     best_node = {"id_node": node_id, "device": "GPU"}
                 elif npu_free:
                     best_node = {"id_node": node_id, "device": "NPU"}
@@ -587,8 +595,8 @@ class OptimumScheduler(Scheduler):
         self.disk_reference_bps = disk_reference_bps
         self.energy_profile = load_energy_profile(energy_profile)
         self.latency_profile = load_latency_profile(latency_profile)
-        if bool(self.energy_profile) != bool(self.latency_profile):
-            raise ValueError("energy_profile and latency_profile must be given together")
+        if self.latency_profile and not self.energy_profile:
+            raise ValueError("latency_profile needs the energy_profile too")
 
     def _node_metrics(self, node_id, info):
         url = f"http://{info['ip']}:{info['metric_port']}/metrics"
@@ -631,7 +639,7 @@ class OptimumScheduler(Scheduler):
         return performance, watt, cpu_usage, gpu_usage, npu_usage
 
     def _best_node(self, nodes, role):
-        if self.energy_profile and self.latency_profile:
+        if self.energy_profile:
             if best_node := self._best_node_by_energy_delay(nodes, role):
                 return best_node
             logger.warning("No node of the profiles is usable: using the performance/watt score")
@@ -639,7 +647,8 @@ class OptimumScheduler(Scheduler):
 
     def _best_node_by_energy_delay(self, nodes, role):
         """Minimize energy x time, the classic trade-off between the two: `pending_penalty`
-        is in seconds, added to the expected time of the node."""
+        is in seconds, added to the expected time of the node. Without a latency profile it
+        minimizes the energy alone, and `pending_penalty` is in joules."""
         best_node = {}
         best_cost = float("inf")
 
@@ -648,10 +657,15 @@ class OptimumScheduler(Scheduler):
             for device in candidate_devices(self, node_id, info, role, npu_usage):
                 key = f"{info.get('hostname')}:{device}"
                 joules = self.energy_profile.get(key, {}).get(role)
-                seconds = self.latency_profile.get(key, {}).get(role)
-                if joules is None or seconds is None:
+                if joules is None:
                     continue
-                cost = joules * (seconds + self.pending_on_node(node_id))
+                if self.latency_profile:
+                    seconds = self.latency_profile.get(key, {}).get(role)
+                    if seconds is None:
+                        continue
+                    cost = joules * (seconds + self.pending_on_node(node_id))
+                else:
+                    cost = joules + self.pending_on_node(node_id)
                 if cost < best_cost:
                     best_cost = cost
                     best_node = {"id_node": node_id, "device": device}
