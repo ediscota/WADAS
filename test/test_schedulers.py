@@ -640,3 +640,54 @@ def test_optimum_without_profiles_is_unchanged(cluster):
     with patch("wadas.ai.schedulers.ray.nodes", return_value=nodes):
         detection, _ = OptimumScheduler().best_nodes_det_class()
     assert detection["id_node"] in ("id-1", "id-3")
+
+
+# --- shared NPU: a busy NPU still takes detections ---
+
+
+def busy_npu_decision(cluster, scheduler_cls, pending=None, **kwargs):
+    nodes = profile_cluster(cluster)
+    cluster["10.0.0.1"] = idle(npu=40.0)  # the NPU of wadas1 is working
+    cluster["10.0.0.3"] = idle(net=9e5)
+    with (
+        patch("wadas.ai.schedulers.ray.nodes", return_value=nodes),
+        patch("wadas.ai.schedulers.read_pending", return_value=pending or PendingLoad()),
+        patch("wadas.ai.schedulers.reserve"),
+    ):
+        return scheduler_cls(**kwargs).best_nodes_det_class()
+
+
+def test_a_busy_npu_is_skipped_by_default(cluster):
+    detection, _ = busy_npu_decision(cluster, MonitoringScheduler, energy_profile=PROFILE)
+    assert detection != {"id_node": "id-1", "device": "NPU"}
+
+
+def test_a_busy_npu_takes_detections_when_it_is_shared(cluster):
+    detection, classification = busy_npu_decision(
+        cluster, MonitoringScheduler, energy_profile=PROFILE, npu_shared=True
+    )
+    assert detection == {"id_node": "id-1", "device": "NPU"}
+    assert classification["device"] != "NPU"  # classification never uses the NPU
+
+
+def test_a_just_assigned_npu_takes_detections_when_it_is_shared(cluster):
+    pending = PendingLoad([("id-1", "NPU", "DETECTION")])
+    free, _ = energy_decision(cluster, pending, pending_penalty=1.0)
+    shared, _ = energy_decision(cluster, pending, pending_penalty=1.0, npu_shared=True)
+    assert free["device"] != "NPU"
+    assert shared == {"id_node": "id-1", "device": "NPU"}
+
+
+def test_the_recent_placement_penalty_still_moves_work_off_a_shared_npu(cluster):
+    # The NPU costs 20 J, the GPU of wadas3 100 J, and each recent placement on wadas1 adds 20 J:
+    # with 5 of them the NPU costs 120 J, more than the GPU of wadas3.
+    pending = PendingLoad([("id-1", "NPU", "DETECTION")] * 5)
+    detection, _ = energy_decision(cluster, pending, pending_penalty=20.0, npu_shared=True)
+    assert detection == {"id_node": "id-3", "device": "GPU"}
+
+
+@pytest.mark.parametrize("scheduler_cls", [ActuatorScheduler, OptimumScheduler])
+def test_the_other_schedulers_share_the_npu_too(cluster, scheduler_cls):
+    kwargs = {"npu_first": True} if scheduler_cls is ActuatorScheduler else {}
+    detection, _ = busy_npu_decision(cluster, scheduler_cls, npu_shared=True, **kwargs)
+    assert detection == {"id_node": "id-1", "device": "NPU"}

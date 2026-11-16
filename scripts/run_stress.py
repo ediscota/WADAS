@@ -38,7 +38,7 @@ from energy import energy_between, measure_idle_watts, read_energy
 from run_scenario import alive_node_names, git_commit, package_version, prepare_pending_registry
 
 STREAM_SCRIPT = Path(__file__).resolve().with_name("run_stream_task.py")
-USE_CASES = ("MONITORING", "ACTUATOR", "CRITICAL")
+USE_CASES = ("MONITORING", "ACTUATOR", "CRITICAL", "PINNED")
 DEFAULT_STEPS = "1,2,4,6,8,12,16,20,24,32"
 
 STEP_FIELDS = [

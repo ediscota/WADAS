@@ -11,6 +11,12 @@
 #
 # Run ids: <PREFIX>_<config>_<rep>, results in ~/wadas_results. Repetitions alternate the
 # order of the configurations, so that a slow drift of the machines does not favour one.
+#
+# CONFIGS chooses the configurations (default: the four above). Two more study the NPU:
+#   npupin     detection pinned on the NPU of wadas1, classification on the GPU of wadas2: how
+#              many continuous streams one NPU sustains
+#   monshared  Resource-Aware on the energy profile with the NPU shared between detections
+#              (npu_shared), against monenergy where an NPU takes one task at a time
 
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -18,6 +24,7 @@ cd "$(dirname "$0")/.." || exit 1
 PREFIX="${PREFIX:-st}"
 REPS="${REPS:-1}"
 STEPS="${STEPS:-1,2,4,6,8,12,16,20,24,32}"
+CONFIGS="${CONFIGS:-monorig monenergy actpend critenergy}"
 DETECTION_MODEL="${DETECTION_MODEL:-MDV6b-yolov9c}"
 CLASSIFICATION_MODEL="${CLASSIFICATION_MODEL:-DFv1.4}"
 PROFILE="${PROFILE:-scripts/energy_profile_mdv6b_dfv14.json}"
@@ -28,6 +35,7 @@ export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 export OPENCL_VENDOR_PATH=/etc/OpenCL/vendors
 
 ENERGY="{\"energy_profile\": \"$PROFILE\", \"pending_penalty\": 5}"
+SHARED="{\"energy_profile\": \"$PROFILE\", \"pending_penalty\": 5, \"npu_shared\": true}"
 
 run() {  # run <config> <rep> <use case> <scheduler params>
   echo "=== $(date +%H:%M:%S) $PREFIX $1 rep $2"
@@ -38,9 +46,10 @@ run() {  # run <config> <rep> <use case> <scheduler params>
 
 for rep in $(seq 1 "$REPS"); do
   if [ $((rep % 2)) -eq 1 ]; then
-    configs="monorig monenergy actpend critenergy"
+    configs="$CONFIGS"
   else
-    configs="critenergy actpend monenergy monorig"
+    configs=""
+    for c in $CONFIGS; do configs="$c $configs"; done
   fi
   for config in $configs; do
     case "$config" in
@@ -48,6 +57,9 @@ for rep in $(seq 1 "$REPS"); do
       monenergy) run monenergy "$rep" MONITORING "$ENERGY" ;;
       actpend) run actpend "$rep" ACTUATOR '{"pending_penalty": 0.05}' ;;
       critenergy) run critenergy "$rep" CRITICAL "$ENERGY" ;;
+      npupin) run npupin "$rep" PINNED '{"detection": "wadas1:NPU", "classification": "wadas2:GPU"}' ;;
+      monshared) run monshared "$rep" MONITORING "$SHARED" ;;
+      *) echo "Unknown configuration: $config"; exit 1 ;;
     esac
   done
 done

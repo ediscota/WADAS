@@ -86,6 +86,11 @@ class Scheduler(ABC):
     last `pending_ttl` seconds, which the node metrics do not show yet: each of them
     worsens the score of its node by `pending_penalty`, in the unit of that scheduler's
     score, and a node whose NPU was just assigned no longer counts as having a free NPU.
+
+    An NPU is a candidate for detection only while it is free: idle in the last sampling
+    window and not just assigned (the thesis rule: one task at a time). `npu_shared` removes
+    that condition, so that several detections may share one NPU. For continuous streams,
+    which use the NPU only for a fraction of the time, a busy NPU is not a full one.
     """
 
     def __init__(
@@ -95,7 +100,9 @@ class Scheduler(ABC):
         pending_penalty: float = 0.0,
         pending_ttl: float = DEFAULT_PENDING_TTL,
         capacity_ttl: float = DEFAULT_CAPACITY_TTL,
+        npu_shared: bool = False,
     ):
+        self.npu_shared = npu_shared
         self.save_scores = save_scores
         self.scores_path = Path(scores_path) if scores_path else None
         self.pending_penalty = pending_penalty
@@ -208,6 +215,10 @@ class Scheduler(ABC):
         """Whether a model was just assigned to the NPU of this node."""
         return self._pending.on_device(node_id, "NPU", max_age=self.pending_ttl) > 0
 
+    def npu_available(self, node_id, npu_usage):
+        """Whether the NPU of this node may take a detection: free, or shared (see above)."""
+        return self.npu_shared or (npu_usage == 0 and not self.npu_is_pending(node_id))
+
     def _uses_pending(self):
         """Whether the decisions read and record the pending load."""
         return self.pending_penalty > 0
@@ -285,15 +296,14 @@ def load_latency_profile(profile):
 
 def candidate_devices(scheduler, node_id, info, role, npu_usage):
     """Devices a task of `role` may run on in this node: the NPU only accelerates detection,
-    and only one task at a time."""
+    and, unless `npu_shared`, only one task at a time."""
     devices = ["CPU"]
     if info["resources"].get("GPU", 0) > 0:
         devices.append("GPU")
     if (
         role == "DETECTION"
         and info["resources"].get("NPU", 0) > 0
-        and npu_usage == 0
-        and not scheduler.npu_is_pending(node_id)
+        and scheduler.npu_available(node_id, npu_usage)
     ):
         devices.append("NPU")
     return devices
@@ -410,8 +420,7 @@ class MonitoringScheduler(Scheduler):
             npu_free = (
                 role == "DETECTION"
                 and info["resources"].get("NPU", 0) > 0
-                and npu_usage == 0
-                and not self.npu_is_pending(node_id)
+                and self.npu_available(node_id, npu_usage)
             )
 
             if npu_free:
@@ -541,8 +550,7 @@ class ActuatorScheduler(Scheduler):
                 npu_free = (
                     role == "DETECTION"
                     and info["resources"].get("NPU", 0) > 0
-                    and npu_usage == 0
-                    and not self.npu_is_pending(node_id)
+                    and self.npu_available(node_id, npu_usage)
                 )
                 if self.npu_first and npu_free:
                     best_node = {"id_node": node_id, "device": "NPU"}
@@ -691,8 +699,7 @@ class OptimumScheduler(Scheduler):
                 if (
                     role == "DETECTION"
                     and has_npu
-                    and npu_usage == 0
-                    and not self.npu_is_pending(node_id)
+                    and self.npu_available(node_id, npu_usage)
                 ):
                     best_device = "NPU"
                 elif has_gpu:
