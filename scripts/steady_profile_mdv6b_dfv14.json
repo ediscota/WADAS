@@ -1,0 +1,126 @@
+{
+  "steady": {
+    "wadas1:GPU": {
+      "CLASSIFICATION": {
+        "items": 484,
+        "s": 0.118,
+        "J": 1.505,
+        "busy": 0.475,
+        "fps": 8.0,
+        "run": "sp_wadas2-GPU_wadas1-GPU_f8",
+        "shares_driver_node": false
+      },
+      "DETECTION": {
+        "items": 618,
+        "s": 0.0848,
+        "J": 1.071,
+        "busy": 0.435,
+        "fps": 8.0,
+        "run": "sp_wadas1-GPU_wadas5-GPU_f8",
+        "shares_driver_node": false
+      }
+    },
+    "wadas1:NPU": {
+      "DETECTION": {
+        "items": 646,
+        "s": 0.0619,
+        "J": 0.534,
+        "busy": 0.325,
+        "fps": 8.0,
+        "run": "sp_wadas1-NPU_wadas3-GPU_f8",
+        "shares_driver_node": false
+      }
+    },
+    "wadas2:GPU": {
+      "CLASSIFICATION": {
+        "items": 371,
+        "s": 0.1286,
+        "J": 1.534,
+        "busy": 0.403,
+        "fps": 4.0,
+        "run": "sp_wadas3-GPU_wadas2-GPU_f4",
+        "shares_driver_node": false
+      },
+      "DETECTION": {
+        "items": 728,
+        "s": 0.0858,
+        "J": 0.942,
+        "busy": 0.511,
+        "fps": 8.0,
+        "run": "sp_wadas2-GPU_wadas1-GPU_f8",
+        "shares_driver_node": false
+      }
+    },
+    "wadas2:NPU": {
+      "DETECTION": {
+        "items": 648,
+        "s": 0.0587,
+        "J": 0.432,
+        "busy": 0.312,
+        "fps": 8.0,
+        "run": "sp_wadas2-NPU_wadas4-GPU_f8",
+        "shares_driver_node": false
+      }
+    },
+    "wadas3:GPU": {
+      "CLASSIFICATION": {
+        "items": 401,
+        "s": 0.1835,
+        "J": 8.987,
+        "busy": 0.663,
+        "fps": 8.0,
+        "run": "sp_wadas1-NPU_wadas3-GPU_f8",
+        "shares_driver_node": false
+      },
+      "DETECTION": {
+        "items": 578,
+        "s": 0.1292,
+        "J": 6.159,
+        "busy": 0.619,
+        "fps": 8.0,
+        "run": "sp_wadas3-GPU_wadas2-GPU_f8",
+        "shares_driver_node": false
+      }
+    },
+    "wadas4:GPU": {
+      "CLASSIFICATION": {
+        "items": 403,
+        "s": 0.1846,
+        "J": 9.934,
+        "busy": 0.673,
+        "fps": 8.0,
+        "run": "sp_wadas2-NPU_wadas4-GPU_f8",
+        "shares_driver_node": false
+      },
+      "DETECTION": {
+        "items": 516,
+        "s": 0.1275,
+        "J": 6.719,
+        "busy": 0.552,
+        "fps": 8.0,
+        "run": "sp_wadas4-GPU_wadas3-GPU_f8",
+        "shares_driver_node": false
+      }
+    },
+    "wadas5:GPU": {
+      "CLASSIFICATION": {
+        "items": 373,
+        "s": 0.1648,
+        "J": 7.483,
+        "busy": 0.557,
+        "fps": 8.0,
+        "run": "sp_wadas1-GPU_wadas5-GPU_f8",
+        "shares_driver_node": true
+      },
+      "DETECTION": {
+        "items": 547,
+        "s": 0.1102,
+        "J": 4.581,
+        "busy": 0.505,
+        "fps": 8.0,
+        "run": "sp_wadas5-GPU_wadas4-GPU_f8",
+        "shares_driver_node": true
+      }
+    }
+  }
+}

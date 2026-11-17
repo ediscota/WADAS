@@ -63,6 +63,9 @@ STEP_FIELDS = [
     "power_active_w",
     "j_per_frame",
     "energy_by_node_j",
+    "idle_by_node_w",
+    "measure_start",
+    "measure_end",
 ]
 STREAM_FIELDS = [
     "run_id",
@@ -273,7 +276,7 @@ def sleep_until(epoch):
         time.sleep(delay)
 
 
-def run_step(args, n_streams, videos, run_dir, node_ips, idle_w):
+def run_step(args, n_streams, videos, run_dir, node_ips, idle_by_ip):
     step_dir = run_dir / f"n{n_streams:03d}"
     launch_start = time.time() + 2.0
     measure_start = launch_start + (n_streams - 1) * args.stagger + args.warmup
@@ -318,9 +321,11 @@ def run_step(args, n_streams, videos, run_dir, node_ips, idle_w):
         args.latency_limit,
         args.min_throughput,
     )
+    summary.update(measure_start=measure_start, measure_end=measure_end)
     if args.measure_energy:
         per_node, joules = energy_between(before, after)
         if joules is not None:
+            idle_w = sum(idle_by_ip.values())
             active = joules - idle_w * args.window
             summary.update(
                 idle_w=idle_w,
@@ -329,19 +334,19 @@ def run_step(args, n_streams, videos, run_dir, node_ips, idle_w):
                 power_active_w=active / args.window,
                 j_per_frame=active / summary["n_completed"] if summary["n_completed"] else None,
                 energy_by_node_j=json.dumps({ip: round(j, 1) for ip, j in per_node.items()}),
+                idle_by_node_w=json.dumps({ip: round(w, 2) for ip, w in idle_by_ip.items()}),
             )
     return summary, streams
 
 
-def cooldown(args, node_ips, idle_w):
-    """Wait --cooldown seconds; with energy, measure the idle power again in the last
-    --step-idle of them, so that every step subtracts a baseline taken just before it."""
+def cooldown(args, node_ips, idle_by_ip):
+    """Wait --cooldown seconds; with energy, measure the idle power of every node again in the
+    last --step-idle of them, so that every step subtracts a baseline taken just before it."""
     if not args.measure_energy:
         time.sleep(args.cooldown)
-        return idle_w
+        return idle_by_ip
     time.sleep(args.cooldown - args.step_idle)
-    idle_by_ip = measure_idle_watts(node_ips, args.step_idle)
-    return sum(idle_by_ip.values()) if idle_by_ip else idle_w
+    return measure_idle_watts(node_ips, args.step_idle) or idle_by_ip
 
 
 def write_metadata(args, run_dir, videos):
@@ -371,14 +376,13 @@ def main(argv=None):
     write_metadata(args, run_dir, videos)
 
     node_names = alive_node_names()
-    node_ips, idle_w = list(node_names), None
+    node_ips, idle_by_ip = list(node_names), None
     if args.measure_energy:
         print(f"Measuring the idle power of {len(node_ips)} node(s) for {args.idle_seconds:g}s...")
         idle_by_ip = measure_idle_watts(node_ips, args.idle_seconds)
         if idle_by_ip is None:
             sys.exit("Cannot read the energy counters of every node: is the power exporter up?")
-        idle_w = sum(idle_by_ip.values())
-        print(f"Idle power of the cluster: {idle_w:.1f} W", flush=True)
+        print(f"Idle power of the cluster: {sum(idle_by_ip.values()):.1f} W", flush=True)
 
     base = {"run_id": args.run_id, "use_case": args.use_case,
             "scheduler_params": args.scheduler_params}  # fmt: skip
@@ -400,12 +404,13 @@ def main(argv=None):
                 print(f"ABORT: {alive} Ray nodes alive instead of {args.expected_nodes}")
                 break
             print(f"=== {datetime.now():%H:%M:%S} {n_streams} stream(s)", flush=True)
-            summary, streams = run_step(args, n_streams, videos, run_dir, node_ips, idle_w)
+            summary, streams = run_step(args, n_streams, videos, run_dir, node_ips, idle_by_ip)
             names = {ip: node_names.get(ip, ip) for ip in node_ips}
-            if summary.get("energy_by_node_j"):
-                summary["energy_by_node_j"] = json.dumps(
-                    {names[ip]: j for ip, j in json.loads(summary["energy_by_node_j"]).items()}
-                )
+            for key in ("energy_by_node_j", "idle_by_node_w"):
+                if summary.get(key):
+                    summary[key] = json.dumps(
+                        {names[ip]: v for ip, v in json.loads(summary[key]).items()}
+                    )
             summaries.append(summary)
             steps_csv.writerow(dict(base, **summary))
             for stream in streams:
@@ -427,7 +432,7 @@ def main(argv=None):
             )
             if not ramp_should_continue([s["sustainable"] for s in summaries], args.extra_steps):
                 break
-            idle_w = cooldown(args, node_ips, idle_w)
+            idle_by_ip = cooldown(args, node_ips, idle_by_ip)
 
     print(f"\nCapacity: {capacity(summaries)} stream(s) at {args.fps:g} frame/s each")
     print(f"Results: {run_dir}")
