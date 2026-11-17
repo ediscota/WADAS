@@ -247,3 +247,20 @@ def test_the_analysis_reads_both_tests_and_draws_every_chart(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "keeps up with at most 2 photo camera(s)" in out
     assert "det wadas1:NPU" in out
+
+
+def test_throughput_counts_what_finished_in_the_window_whenever_it_arrived():
+    from analyze_cameras import add_throughput
+
+    steps = [{"step": "0"}]
+    # first arrival at 0, warm-up 10 s: the window is 10-20 s
+    items = [
+        {"step": "0", "kind": "photo", "status": "ok", "arrival": "0", "end": "15"},  # old, counted
+        {"step": "0", "kind": "photo", "status": "ok", "arrival": "12", "end": "19"},
+        {"step": "0", "kind": "photo", "status": "ok", "arrival": "12", "end": "25"},  # too late
+        {"step": "0", "kind": "video", "status": "ok", "arrival": "11", "end": "16"},
+        {"step": "0", "kind": "photo", "status": "error", "arrival": "13", "end": "14"},
+    ]
+    add_throughput(steps, items, window=10.0, warmup=10.0)
+    assert steps[0]["photos_per_s"] == pytest.approx(0.2)
+    assert steps[0]["clips_per_min"] == pytest.approx(6.0)

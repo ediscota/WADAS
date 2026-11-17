@@ -49,8 +49,36 @@ def read_run(run_dir):
             step[key] = number(step.get(key))
         step["keeps_up"] = step["keeps_up"] == "True"
     window = float(meta["args"]["window"])
+    items_file = run_dir / "items.csv"
+    if items_file.exists():
+        with open(items_file, newline="") as f:
+            add_throughput(steps, list(csv.DictReader(f)), window, float(meta["args"]["warmup"]))
     return {"name": run_dir.name, "placement": meta.get("placement", {}), "steps": steps,
             "window": window}  # fmt: skip
+
+
+def add_throughput(steps, items, window, warmup):
+    """Photos/s and clips/min processed by the pipeline in each measured window.
+
+    These count every item that *finished* inside the window, whenever it arrived. The
+    "done" counts of steps.csv only include items that also *arrived* in the window: under
+    overload those are reached late or never, so they shrink although the pipeline works at
+    the same speed. The throughput is the processing rate; "done" is what the cameras got back.
+    """
+    for step in steps:
+        rows = [r for r in items if r["step"] == step["step"]]
+        step["photos_per_s"] = step["clips_per_min"] = None
+        if not rows:
+            continue
+        measure_start = min(float(r["arrival"]) for r in rows) + warmup
+        measure_end = measure_start + window
+
+        def finished(kind, rows=rows, start=measure_start, end=measure_end):
+            return sum(1 for r in rows if r["kind"] == kind and r["status"] == "ok"
+                       and start <= float(r["end"]) <= end)  # fmt: skip
+
+        step["photos_per_s"] = finished("photo") / window
+        step["clips_per_min"] = finished("video") / window * 60
 
 
 def max_cameras_kept_up(steps):
@@ -67,7 +95,7 @@ def by_cameras(steps, key):
     """{photo cameras: mean of key over the steps with that many cameras}."""
     groups = defaultdict(list)
     for step in steps:
-        if step[key] is not None:
+        if step.get(key) is not None:
             groups[int(step["photo_cameras"])].append(step[key])
     return {n: mean(values) for n, values in sorted(groups.items())}
 
@@ -82,8 +110,9 @@ def placement_text(placement):
 def print_table(runs):
     for run in runs:
         print(f"\n{run['name']}  ({placement_text(run['placement'])})")
-        print(f"  {'cams':>6s} {'photos':>11s} {'p95 photo':>9s} {'clips':>7s} {'p95 clip':>8s} "
-              f"{'backlog':>7s} {'delay/min':>9s} {'W above idle':>12s}  verdict")  # fmt: skip
+        print(f"  {'cams':>6s} {'photos/s':>8s} {'clips/min':>9s} {'photos':>11s} {'p95 photo':>9s} "
+              f"{'clips':>7s} {'p95 clip':>8s} {'backlog':>7s} {'delay/min':>9s} "
+              f"{'W above idle':>12s}  verdict")  # fmt: skip
         for s in run["steps"]:
             cams = f"{int(s['photo_cameras'])}+{int(s['video_cameras'])}"
             photos = (f"{int(s['photos_done'])}/{int(s['photos_offered'])}"
@@ -93,7 +122,10 @@ def print_table(runs):
             p95c = f"{s['clip_p95_s']:.1f} s" if s["clip_p95_s"] is not None else "-"
             watts = f"{s['power_active_w']:.1f}" if s["power_active_w"] is not None else "-"
             verdict = "keeps up" if s["keeps_up"] else s["reasons"]
-            print(f"  {cams:>6s} {photos:>11s} {p95p:>9s} {clips:>7s} {p95c:>8s} "
+            rate = f"{s['photos_per_s']:.2f}" if s.get("photos_per_s") is not None else "-"
+            clip_rate = f"{s['clips_per_min']:.1f}" if s.get("clips_per_min") else "-"
+            print(f"  {cams:>6s} {rate:>8s} {clip_rate:>9s} {photos:>11s} {p95p:>9s} {clips:>7s} "
+                  f"{p95c:>8s} "
                   f"{int(s['backlog']):>7d} {s['delay_growth_s_per_min']:>+9.1f} {watts:>12s}  "
                   f"{verdict}")  # fmt: skip
         if not any(s["video_cameras"] for s in run["steps"]):
@@ -125,9 +157,8 @@ def plot(runs, out_dir):
         top = max(int(s["photo_cameras"]) for r in runs_a for s in r["steps"])
         ax.plot([0, top], [0, top], color="0.7", linestyle="--", label="sent = processed")
         for run in runs_a:
-            done = by_cameras(run["steps"], "photos_done")
-            ax.plot(list(done), [v / run["window"] for v in done.values()], marker="o",
-                    label=run["name"])  # fmt: skip
+            done = by_cameras(run["steps"], "photos_per_s")
+            ax.plot(list(done), list(done.values()), marker="o", label=run["name"])
         ax.set(xlabel="photos/s sent", ylabel="photos/s processed")
         ax.legend()
         fig.savefig(out_dir / "test_a_throughput.png", dpi=150, bbox_inches="tight")
