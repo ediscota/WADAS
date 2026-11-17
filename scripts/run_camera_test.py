@@ -21,10 +21,18 @@ too, for --measure-energy). The AiModel is created once, as when WADAS starts, t
   python scripts/run_camera_test.py --use-case CRITICAL --steps 5+5,5+5 --window 300 \\
       --scheduler-params '{"energy_profile": "scripts/energy_profile_mdv6b_dfv14.json",
                            "pending_penalty": 5}'
+
+With --dispatcher the single pipeline is replaced by the dispatcher prototype (dispatcher.py):
+warm workers on every device of --profile, and a scheduler (--dispatcher round_robin,
+least_loaded or cost, the cost weighted by --use-case) that picks a worker for every call. Items
+then run in parallel, up to --max-parallel at a time, still through the unchanged AiModel methods.
+
+  python scripts/run_camera_test.py --use-case MONITORING --dispatcher cost --steps 17+0
 """
 
 import argparse
 import bisect
+import itertools
 import csv
 import json
 import math
@@ -42,8 +50,11 @@ from statistics import median
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from dispatcher import run_dispatched  # noqa: E402
 from energy import energy_between, measure_idle_watts, read_energy  # noqa: E402
 from run_scenario import alive_node_names, git_commit, package_version  # noqa: E402
+
+DEFAULT_PROFILE = "scripts/steady_profile_mdv6b_dfv14.json"
 
 USE_CASES = ("MONITORING", "ACTUATOR", "CRITICAL")
 OUTPUT_DIRS = ("detection_output", "classification_output", "wadas_motion_detection", "video_frames")
@@ -64,6 +75,10 @@ ITEM_FIELDS = [
     "n_animals",
     "status",
     "error",
+    "det_worker",
+    "cls_worker",
+    "det_call_s",
+    "cls_call_s",
 ]
 STEP_FIELDS = [
     "run_id",
@@ -98,6 +113,8 @@ STEP_FIELDS = [
     "energy_active_j",
     "power_active_w",
     "energy_by_node_j",
+    "dispatcher",
+    "worker_stats",
 ]
 
 
@@ -145,6 +162,19 @@ def parse_args(argv=None):
     parser.add_argument("--expected-nodes", type=int, default=5)
     parser.add_argument("--results-dir", type=Path, default=Path.home() / "wadas_results")
     parser.add_argument("--run-id", default=datetime.now().strftime("cam-%Y%m%d-%H%M%S"))
+    parser.add_argument(
+        "--dispatcher",
+        choices=("round_robin", "least_loaded", "cost"),
+        help="Use the dispatcher prototype with this policy instead of the single pipeline",
+    )
+    parser.add_argument("--slots", type=int, default=2, help="Calls in flight per worker")
+    parser.add_argument(
+        "--max-parallel", type=int, help="Items in progress at once (default: all the slots)"
+    )
+    parser.add_argument("--profile", default=DEFAULT_PROFILE, help="Steady-state profile (JSON)")
+    parser.add_argument(
+        "--exclude", nargs="*", default=[], help="Workers left out: host:DEVICE[:ROLE]"
+    )
     args = parser.parse_args(argv)
     try:
         json.loads(args.scheduler_params)
@@ -338,15 +368,115 @@ def make_ai_model(args):
     return AiModel()
 
 
-def make_processor(ai_model):
+def make_dispatched_model(args, photos):
+    """AiModel whose pipeline is a DispatchedPipeline over warm workers on every device.
+
+    Returns (ai_model, dispatched pipeline, registry). The workers are created on their node
+    with their model loaded, then warmed up with one real call each (a photo with an animal),
+    so that model compilation is not measured."""
+    import ray
+    from PIL import Image
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    from dispatcher import WEIGHTS, DispatchedPipeline, Registry, workers_from_profile
+    from wadas.ai.models import Classifier, OVMegaDetectorV5
+    from wadas.ai.pipeline import NAME_TO_DETECTOR, DetectionPipeline
+    from wadas.domain.ai_model import AiModel
+
+    det_version = args.detection_model or AiModel.detection_model_version
+    cls_version = args.classification_model or AiModel.classification_model_version
+    AiModel.detection_model_version = det_version
+    AiModel.classification_model_version = cls_version
+    AiModel.distributed_inference = True
+    AiModel.video_fps = args.fps
+
+    profile_path = Path(args.profile)
+    if not profile_path.is_absolute():
+        profile_path = REPO_ROOT / profile_path
+    profile = json.loads(profile_path.read_text())["steady"]
+    workers = workers_from_profile(profile, exclude=set(args.exclude))
+    ray.init(address="auto", logging_level="ERROR")
+    node_ids = {n["NodeManagerHostname"]: n["NodeID"] for n in ray.nodes() if n["Alive"]}
+    for w in workers:
+        if w.host not in node_ids:
+            raise RuntimeError(f"No alive Ray node {w.host} for worker {w.name}")
+        if w.role == "DETECTION":
+            cls, kwargs = NAME_TO_DETECTOR[det_version], {"model_name": det_version}
+        else:
+            cls, kwargs = Classifier, {"version": cls_version}
+        strategy = NodeAffinitySchedulingStrategy(node_id=node_ids[w.host], soft=False)
+        w.actor = ray.remote(cls).options(scheduling_strategy=strategy).remote(
+            device=w.device, **kwargs
+        )
+
+    animal_idx = next(k for k, v in OVMegaDetectorV5.CLASS_NAMES.items() if v == "animal")
+    template = object.__new__(DetectionPipeline)
+    template.__dict__.update(distributed_inference=True, classifier_version=cls_version,
+                             language=AiModel.language, animal_class_idx=animal_idx,
+                             detection_model=None, classifier=None)  # fmt: skip
+    bound = {}
+
+    def bind(worker):
+        """A DetectionPipeline whose remote model is this worker's actor."""
+        if worker.name not in bound:
+            pipeline = object.__new__(DetectionPipeline)
+            pipeline.__dict__.update(template.__dict__)
+            if worker.role == "DETECTION":
+                pipeline.detection_model = worker.actor
+            else:
+                pipeline.classifier = worker.actor
+            bound[worker.name] = pipeline
+        return bound[worker.name]
+
+    # Warm-up: one detection per detection worker, one classification per classification worker
+    detections = None
+    for photo in photos:
+        img = Image.open(photo).convert("RGB")
+        for w in [w for w in workers if w.role == "DETECTION"]:
+            results = bind(w).run_detection(img, AiModel.detection_threshold)
+        if len(results["detections"].xyxy):
+            detections = (img, results)
+            break
+    if detections is None:
+        raise RuntimeError("No test photo has an animal: cannot warm up the classifiers")
+    for w in [w for w in workers if w.role == "CLASSIFICATION"]:
+        bind(w).classify(detections[0], detections[1], AiModel.classification_threshold)
+
+    registry = Registry(workers, args.dispatcher, args.slots, WEIGHTS[args.use_case])
+    dispatched = DispatchedPipeline(registry, bind, animal_idx, template.filter_animal_detections)
+    ai_model = object.__new__(AiModel)  # no __init__: it would place a single pipeline
+    ai_model.detection_pipeline = dispatched
+    ai_model.original_image = ""
+    return ai_model, dispatched, registry
+
+
+def make_processor(ai_model, dispatched=None):
     """process(kind, media, upload_dir): one item, exactly as AnimalDetectionAndClassificationMode
-    does. Photos are copied into upload_dir first, under a name that is never reused."""
-    counter = iter(range(10**9))
+    does. Photos are copied into upload_dir first, under a name that is never reused.
+
+    With `dispatched` (a DispatchedPipeline) items run in parallel: clips are copied too, since
+    process_video_offline names its output after the clip, and every record says which workers
+    the item used and how long its remote calls took."""
+    counter = itertools.count()
+    lock = threading.Lock()
+
+    def unique(upload_dir, media):
+        with lock:
+            return upload_dir / f"{next(counter):06d}_{Path(media).name}"
 
     def process(kind, media, upload_dir):
+        if dispatched is None:
+            return process_item(kind, media, upload_dir)
+        log = dispatched.start_item()
+        result = process_item(kind, media, upload_dir)
+        result.update(det_worker=log.det_worker, cls_worker=log.cls_worker,
+                      det_call_s=log.det_s, cls_call_s=log.cls_s)  # fmt: skip
+        return result
+
+    def process_item(kind, media, upload_dir):
         if kind == "photo":
             # An FTP upload creates a new file; process_image may modify or delete it.
-            path = upload_dir / f"{next(counter):06d}_{Path(media).name}"
+            path = unique(upload_dir, media)
             shutil.copyfile(media, path)
             results, detected_img_path = ai_model.process_image(str(path), True)
             n_animals = 0
@@ -355,6 +485,10 @@ def make_processor(ai_model):
                 if n_animals:
                     ai_model.classify(str(path), results)
             return {"n_animals": n_animals}
+        if dispatched is not None:
+            clip = unique(upload_dir, media)
+            shutil.copyfile(media, clip)
+            media = clip
         tracked, video_path, _ = ai_model.process_video_offline(
             video_path=str(media), classification=True, save_processed_video=True,
             save_snapshot=False,
@@ -404,7 +538,8 @@ def read_energy_at(times, node_ips, readings):
     return thread
 
 
-def run_step(args, index, step, process, photos, videos, durations, node_ips, idle_w, work_dir):
+def run_step(args, index, step, process, photos, videos, durations, node_ips, idle_w, work_dir,
+             registry=None):
     n_photo, n_video = step
     clean_outputs(work_dir)
     upload_dir = work_dir / "uploads"
@@ -427,9 +562,15 @@ def run_step(args, index, step, process, photos, videos, durations, node_ips, id
         times = {"before": measure_start, "after": measure_end}
         energy_thread = read_energy_at(times, node_ips, readings)
 
-    records, backlog = run_queue(
-        arrivals, lambda kind, media: process(kind, media, upload_dir), measure_end
-    )
+    def one(kind, media):
+        return process(kind, media, upload_dir)
+
+    if registry is None:
+        records, backlog = run_queue(arrivals, one, measure_end)
+    else:
+        registry.reset_stats()
+        max_parallel = args.max_parallel or args.slots * len(registry.workers)
+        records, backlog = run_dispatched(arrivals, one, measure_end, max_parallel)
     add_queue_lengths(records)
     summary = summarize_step(
         records,
@@ -442,6 +583,8 @@ def run_step(args, index, step, process, photos, videos, durations, node_ips, id
         args.min_throughput,
     )
     summary.update(step=index, photo_cameras=n_photo, video_cameras=n_video)
+    if registry is not None:
+        summary.update(dispatcher=registry.policy, worker_stats=json.dumps(registry.stats()))
     if energy_thread:
         energy_thread.join()
         per_node, joules = energy_between(readings.get("before"), readings.get("after"))
@@ -508,24 +651,34 @@ def main(argv=None):
 
     import ray
 
-    print("Creating the WADAS pipeline (one scheduling decision)...", flush=True)
+    registry = None
     t0 = time.perf_counter()
-    ai_model = make_ai_model(args)
-    pipeline = ai_model.detection_pipeline
-    ray_nodes = {n["NodeID"]: n for n in ray.nodes()}
-    placement = {
-        "det_node": node_name(pipeline.best_detection_node, ray_nodes),
-        "det_device": pipeline.best_detection_node["device"],
-        "cls_node": node_name(pipeline.best_classification_node, ray_nodes),
-        "cls_device": pipeline.best_classification_node["device"],
-        "t_init_s": time.perf_counter() - t0,
-    }
+    if args.dispatcher:
+        print(f"Creating the warm workers ({args.dispatcher})...", flush=True)
+        ai_model, dispatched, registry = make_dispatched_model(args, photos)
+        placement = {"dispatcher": args.dispatcher, "slots": args.slots,
+                     "workers": [w.name for w in registry.workers],
+                     "t_init_s": time.perf_counter() - t0}  # fmt: skip
+        process = make_processor(ai_model, dispatched)
+    else:
+        print("Creating the WADAS pipeline (one scheduling decision)...", flush=True)
+        ai_model = make_ai_model(args)
+        pipeline = ai_model.detection_pipeline
+        ray_nodes = {n["NodeID"]: n for n in ray.nodes()}
+        placement = {
+            "det_node": node_name(pipeline.best_detection_node, ray_nodes),
+            "det_device": pipeline.best_detection_node["device"],
+            "cls_node": node_name(pipeline.best_classification_node, ray_nodes),
+            "cls_device": pipeline.best_classification_node["device"],
+            "t_init_s": time.perf_counter() - t0,
+        }
+        process = make_processor(ai_model)
     print(f"Placement: {placement}", flush=True)
     write_metadata(args, run_dir, photos, videos, placement)
-    process = make_processor(ai_model)
 
     base = {"run_id": args.run_id, "use_case": args.use_case,
-            "scheduler_params": args.scheduler_params, **placement}  # fmt: skip
+            "scheduler_params": args.scheduler_params,
+            **{k: v for k, v in placement.items() if k in STEP_FIELDS}}  # fmt: skip
     try:
         with (
             open(run_dir / "steps.csv", "w", newline="") as steps_file,
@@ -545,7 +698,7 @@ def main(argv=None):
                       f"{step[0]} photo + {step[1]} video camera(s)", flush=True)  # fmt: skip
                 summary, records = run_step(
                     args, index, step, process, photos, videos, durations, node_ips, idle_w,
-                    work_dir,
+                    work_dir, registry,
                 )  # fmt: skip
                 if summary.get("energy_by_node_j"):
                     summary["energy_by_node_j"] = json.dumps(
